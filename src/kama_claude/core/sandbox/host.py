@@ -12,9 +12,12 @@ from kama_claude.core.sandbox.models import ExecRequest, ExecResult, SandboxLimi
 class HostBackend(SandboxBackend):
     """Execute commands in a dedicated host process group without strong isolation."""
 
-    # 保存兼容后端的工作目录标识，供其生命周期与调用方保持一致
+    # 规范化并验证兼容后端的可信运行环境根目录
     def __init__(self, work_dir: Path) -> None:
-        self._work_dir = work_dir
+        resolved_work_dir = work_dir.resolve()
+        if not resolved_work_dir.is_dir():
+            raise ValueError("work_dir must be an existing directory")
+        self._work_dir = resolved_work_dir
 
     # 返回兼容模式后端的稳定名称
     @property
@@ -25,6 +28,18 @@ class HostBackend(SandboxBackend):
     @property
     def strongly_isolated(self) -> bool:
         return False
+
+    # 验证精确环境中的运行时目录均位于可信工作目录内
+    def _validate_runtime_environment(self, env: dict[str, str]) -> None:
+        for name in ("HOME", "TMPDIR"):
+            value = env.get(name)
+            if value is None:
+                raise ValueError(f"{name} must be provided in request environment")
+            path = Path(value)
+            if not path.is_absolute():
+                raise ValueError(f"{name} must be an absolute path")
+            if not path.resolve().is_relative_to(self._work_dir):
+                raise ValueError(f"{name} must resolve inside work_dir")
 
     # 向进程组发送信号并忽略进程恰好退出的竞态
     @staticmethod
@@ -47,6 +62,7 @@ class HostBackend(SandboxBackend):
 
     # 在兼容模式下执行命令并标准化超时、输出和退出码
     async def execute(self, request: ExecRequest, limits: SandboxLimits) -> ExecResult:
+        self._validate_runtime_environment(request.env)
         proc = await asyncio.create_subprocess_exec(
             "/bin/sh",
             "-lc",

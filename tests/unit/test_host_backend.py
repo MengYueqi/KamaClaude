@@ -10,6 +10,16 @@ from kama_claude.core.sandbox.host import HostBackend
 from kama_claude.core.sandbox.models import ExecRequest, SandboxLimits
 
 
+# 功能：构造位于可信运行目录内的 HOME 与 TMPDIR
+# 设计：所有允许执行的测试都模拟环境构造器提供的受控运行目录
+def _runtime_env(work_dir: Path) -> dict[str, str]:
+    home = work_dir / "home"
+    tmpdir = work_dir / "tmp"
+    home.mkdir(exist_ok=True)
+    tmpdir.mkdir(exist_ok=True)
+    return {"HOME": str(home), "TMPDIR": str(tmpdir)}
+
+
 # 功能：轮询确认超时命令派生的子进程已经不再存在
 # 设计：有界等待避免测试本身卡住，同时防止测试结束后遗留宿主进程
 async def _wait_for_process_exit(pid: int) -> None:
@@ -28,7 +38,7 @@ async def _wait_for_process_exit(pid: int) -> None:
 async def test_host_backend_runs_command_in_requested_directory(tmp_path: Path) -> None:
     backend = HostBackend(tmp_path)
     limits = SandboxLimits(5, 1_024, 1_024, 1.0, 64, 64)
-    request = ExecRequest("pwd", tmp_path, {"HOME": str(tmp_path)})
+    request = ExecRequest("pwd", tmp_path, _runtime_env(tmp_path))
 
     result = await backend.execute(request, limits)
 
@@ -45,7 +55,7 @@ async def test_host_backend_runs_command_in_requested_directory(tmp_path: Path) 
 async def test_host_backend_merges_stderr_into_output(tmp_path: Path) -> None:
     backend = HostBackend(tmp_path)
     limits = SandboxLimits(5, 1_024, 1_024, 1.0, 64, 64)
-    request = ExecRequest("printf out; printf err >&2", tmp_path, {"HOME": str(tmp_path)})
+    request = ExecRequest("printf out; printf err >&2", tmp_path, _runtime_env(tmp_path))
 
     result = await backend.execute(request, limits)
 
@@ -58,7 +68,7 @@ async def test_host_backend_merges_stderr_into_output(tmp_path: Path) -> None:
 async def test_host_backend_preserves_nonzero_returncode(tmp_path: Path) -> None:
     backend = HostBackend(tmp_path)
     limits = SandboxLimits(5, 1_024, 1_024, 1.0, 64, 64)
-    request = ExecRequest("printf failed; exit 7", tmp_path, {"HOME": str(tmp_path)})
+    request = ExecRequest("printf failed; exit 7", tmp_path, _runtime_env(tmp_path))
 
     result = await backend.execute(request, limits)
 
@@ -72,7 +82,7 @@ async def test_host_backend_preserves_nonzero_returncode(tmp_path: Path) -> None
 async def test_host_backend_truncates_output_by_bytes_before_decoding(tmp_path: Path) -> None:
     backend = HostBackend(tmp_path)
     limits = SandboxLimits(5, 3, 1_024, 1.0, 64, 64)
-    request = ExecRequest("printf 'éé'", tmp_path, {"HOME": str(tmp_path)})
+    request = ExecRequest("printf 'éé'", tmp_path, _runtime_env(tmp_path))
 
     result = await backend.execute(request, limits)
 
@@ -95,7 +105,7 @@ async def test_host_backend_does_not_inherit_host_secret(
         f"print(os.environ.get({secret_name!r}, 'missing'))"
     )
     command = f"exec {shlex.quote(sys.executable)} -c {shlex.quote(script)}"
-    request = ExecRequest(command, tmp_path, {"HOME": str(tmp_path), "ONLY_ALLOWED": "visible"})
+    request = ExecRequest(command, tmp_path, _runtime_env(tmp_path) | {"ONLY_ALLOWED": "visible"})
 
     result = await backend.execute(request, limits)
 
@@ -108,7 +118,7 @@ async def test_host_backend_does_not_inherit_host_secret(
 async def test_host_backend_returns_timeout_result(tmp_path: Path) -> None:
     backend = HostBackend(tmp_path)
     limits = SandboxLimits(1, 1_024, 1_024, 1.0, 64, 64)
-    request = ExecRequest("sleep 60", tmp_path, {"HOME": str(tmp_path)})
+    request = ExecRequest("sleep 60", tmp_path, _runtime_env(tmp_path))
 
     result = await backend.execute(request, limits)
 
@@ -131,10 +141,115 @@ async def test_host_backend_timeout_kills_entire_process_group(tmp_path: Path) -
     command = f"exec {shlex.quote(sys.executable)} -c {shlex.quote(parent_script)}"
     backend = HostBackend(tmp_path)
     limits = SandboxLimits(1, 1_024, 1_024, 1.0, 64, 64)
-    request = ExecRequest(command, tmp_path, {"HOME": str(tmp_path)})
+    request = ExecRequest(command, tmp_path, _runtime_env(tmp_path))
 
     result = await backend.execute(request, limits)
 
     assert result.timed_out is True
     assert pid_file.is_file()
     await _wait_for_process_exit(int(pid_file.read_text()))
+
+
+# 功能：拒绝缺失 HOME 的精确环境并阻止命令启动
+# 设计：登录 shell 不得回退到宿主账户目录读取 profile 或泄露其副作用
+async def test_host_backend_rejects_missing_home_before_start(tmp_path: Path) -> None:
+    marker = tmp_path / "started"
+    env = _runtime_env(tmp_path)
+    del env["HOME"]
+    backend = HostBackend(tmp_path)
+    limits = SandboxLimits(5, 1_024, 1_024, 1.0, 64, 64)
+    request = ExecRequest(f"touch {shlex.quote(str(marker))}", tmp_path, env)
+
+    with pytest.raises(ValueError, match="HOME"):
+        await backend.execute(request, limits)
+
+    assert marker.exists() is False
+
+
+# 功能：拒绝缺失 TMPDIR 的精确环境并阻止命令启动
+# 设计：兼容后端不能让 shell 在缺少受控临时目录时退回宿主默认路径
+async def test_host_backend_rejects_missing_tmpdir_before_start(tmp_path: Path) -> None:
+    marker = tmp_path / "started"
+    env = _runtime_env(tmp_path)
+    del env["TMPDIR"]
+    backend = HostBackend(tmp_path)
+    limits = SandboxLimits(5, 1_024, 1_024, 1.0, 64, 64)
+    request = ExecRequest(f"touch {shlex.quote(str(marker))}", tmp_path, env)
+
+    with pytest.raises(ValueError, match="TMPDIR"):
+        await backend.execute(request, limits)
+
+    assert marker.exists() is False
+
+
+# 功能：拒绝相对 HOME 或 TMPDIR，避免依赖进程当前目录解释运行时环境
+# 设计：环境根必须是明确的绝对路径，不能被 shell 或 cwd 间接改变
+@pytest.mark.parametrize("name", ["HOME", "TMPDIR"])
+async def test_host_backend_rejects_relative_runtime_environment(
+    tmp_path: Path, name: str
+) -> None:
+    marker = tmp_path / "started"
+    env = _runtime_env(tmp_path)
+    env[name] = "relative-runtime-dir"
+    backend = HostBackend(tmp_path)
+    limits = SandboxLimits(5, 1_024, 1_024, 1.0, 64, 64)
+    request = ExecRequest(f"touch {shlex.quote(str(marker))}", tmp_path, env)
+
+    with pytest.raises(ValueError, match=name):
+        await backend.execute(request, limits)
+
+    assert marker.exists() is False
+
+
+# 功能：拒绝解析后位于可信工作目录外的 HOME 或 TMPDIR
+# 设计：绝对路径本身不足以隔离，解析结果必须仍包含在工作目录边界内
+@pytest.mark.parametrize("name", ["HOME", "TMPDIR"])
+async def test_host_backend_rejects_runtime_environment_outside_work_dir(
+    tmp_path: Path, name: str
+) -> None:
+    marker = tmp_path / "started"
+    env = _runtime_env(tmp_path)
+    env[name] = str(tmp_path.parent / "outside-runtime-dir")
+    backend = HostBackend(tmp_path)
+    limits = SandboxLimits(5, 1_024, 1_024, 1.0, 64, 64)
+    request = ExecRequest(f"touch {shlex.quote(str(marker))}", tmp_path, env)
+
+    with pytest.raises(ValueError, match=name):
+        await backend.execute(request, limits)
+
+    assert marker.exists() is False
+
+
+# 功能：拒绝经符号链接解析到可信工作目录外的 HOME 或 TMPDIR
+# 设计：路径字符串看似位于工作目录内时也必须防止符号链接逃逸
+@pytest.mark.parametrize("name", ["HOME", "TMPDIR"])
+async def test_host_backend_rejects_symlinked_runtime_environment_outside_work_dir(
+    tmp_path: Path, name: str
+) -> None:
+    marker = tmp_path / "started"
+    outside = tmp_path.parent / f"outside-runtime-dir-{name}"
+    outside.mkdir()
+    link = tmp_path / "runtime-link"
+    link.symlink_to(outside, target_is_directory=True)
+    env = _runtime_env(tmp_path)
+    env[name] = str(link)
+    backend = HostBackend(tmp_path)
+    limits = SandboxLimits(5, 1_024, 1_024, 1.0, 64, 64)
+    request = ExecRequest(f"touch {shlex.quote(str(marker))}", tmp_path, env)
+
+    with pytest.raises(ValueError, match=name):
+        await backend.execute(request, limits)
+
+    assert marker.exists() is False
+
+
+# 功能：构造时拒绝不存在或非目录的工作目录
+# 设计：环境路径校验依赖可信根，不能将文件或缺失路径静默视作根目录
+@pytest.mark.parametrize("kind", ["missing", "file"])
+def test_host_backend_requires_existing_directory_work_dir(tmp_path: Path, kind: str) -> None:
+    work_dir = tmp_path / kind
+    if kind == "file":
+        work_dir.write_text("not a directory")
+
+    with pytest.raises(ValueError, match="work_dir"):
+        HostBackend(work_dir)
