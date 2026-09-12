@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 import kama_claude.core.tools.invocation as inv_mod
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import ToolCallBlock
+from kama_claude.core.sandbox import (
+    ExecRequest,
+    ExecResult,
+    SandboxBackend,
+    SandboxLimits,
+    WorkspaceFS,
+)
 from kama_claude.core.tools.base import BaseTool, ToolResult
+from kama_claude.core.tools.builtin.bash import BashTool
 from kama_claude.core.tools.errors import RateLimitedError
 from kama_claude.core.tools.invocation import invoke_tool
 from kama_claude.core.tools.registry import ToolRegistry
@@ -59,11 +69,16 @@ class _AlwaysFails(BaseTool):
 
 # --- helper ------------------------------------------------------------------
 
-def _call(name: str) -> ToolCallBlock:
-    return ToolCallBlock(id="t1", name=name, input={})
+def _call(name: str, params: dict[str, object] | None = None) -> ToolCallBlock:
+    return ToolCallBlock(id="t1", name=name, input=params or {})
 
 
-async def _run(tool: BaseTool, *, monkeypatch: pytest.MonkeyPatch) -> tuple[ToolResult, list]:
+async def _run(
+    tool: BaseTool,
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    params: dict[str, object] | None = None,
+) -> tuple[ToolResult, list]:
     monkeypatch.setattr(inv_mod, "_RETRY_BASE_S", 0.0)
     registry = ToolRegistry()
     registry.register(tool)
@@ -74,7 +89,7 @@ async def _run(tool: BaseTool, *, monkeypatch: pytest.MonkeyPatch) -> tuple[Tool
         events.append(e)
 
     bus.subscribe(_collect)
-    result = await invoke_tool(registry, _call(tool.name), bus, run_id="r")
+    result = await invoke_tool(registry, _call(tool.name, params), bus, run_id="r")
     return result, events
 
 
@@ -177,3 +192,81 @@ async def test_failed_event_has_valid_error_class(monkeypatch: pytest.MonkeyPatc
     for e in events:
         if e.type == "tool.call_failed":  # type: ignore[attr-defined]
             assert e.error_class in valid_classes  # type: ignore[attr-defined]
+
+
+# 功能：真实 BashTool 的非零命令结果标记为 command_error 后不重试副作用
+# 设计：recording backend 统计 execute 次数，通过 invoke_tool 完整走重试决策链
+async def test_bash_command_error_executes_backend_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _NonzeroBackend(SandboxBackend):
+        name = "fake"
+        strongly_isolated = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(
+            self, request: ExecRequest, limits: SandboxLimits
+        ) -> ExecResult:
+            self.calls += 1
+            return ExecResult(9, "failed")
+
+    backend = _NonzeroBackend()
+    tool = BashTool(
+        WorkspaceFS(tmp_path),
+        backend,
+        SandboxLimits(30, 1_024, 256, 1.0, 32, 64),
+        (),
+        tmp_path / ".runtime",
+    )
+
+    result, events = await _run(
+        tool, monkeypatch=monkeypatch, params={"command": "work"}
+    )
+
+    assert result.is_error
+    assert result.error_type == "command_error"
+    assert backend.calls == 1
+    failed_events = [e for e in events if e.type == "tool.call_failed"]  # type: ignore[attr-defined]
+    assert len(failed_events) == 1
+
+
+# 功能：真实 BashTool 的瞬时后端异常仍映射 runtime_error 并由调用层重试
+# 设计：后端前两次抛异常、第三次成功，断言完整的三次调用计数
+async def test_bash_runtime_error_remains_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _TransientBackend(SandboxBackend):
+        name = "fake"
+        strongly_isolated = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(
+            self, request: ExecRequest, limits: SandboxLimits
+        ) -> ExecResult:
+            self.calls += 1
+            if self.calls < 3:
+                raise RuntimeError("transient backend detail")
+            return ExecResult(0, "ok")
+
+    backend = _TransientBackend()
+    tool = BashTool(
+        WorkspaceFS(tmp_path),
+        backend,
+        SandboxLimits(30, 1_024, 256, 1.0, 32, 64),
+        (),
+        tmp_path / ".runtime",
+    )
+
+    result, events = await _run(
+        tool, monkeypatch=monkeypatch, params={"command": "work"}
+    )
+
+    assert not result.is_error
+    assert result.content == "ok"
+    assert backend.calls == 3
+    failed_events = [e for e in events if e.type == "tool.call_failed"]  # type: ignore[attr-defined]
+    assert [e.attempt for e in failed_events] == [1, 2]  # type: ignore[attr-defined]

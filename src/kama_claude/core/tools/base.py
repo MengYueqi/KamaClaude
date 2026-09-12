@@ -11,7 +11,8 @@ from pydantic import BaseModel
 class ToolResult:
     content: str
     is_error: bool = False
-    # "runtime_error" | "timeout" | "schema_error" | "permission_denied"
+    # "runtime_error" | "timeout" | "schema_error" | "permission_denied" |
+    # "command_error" | "sandbox_violation" | "sandbox_unavailable"
     error_type: str | None = None
 
 
