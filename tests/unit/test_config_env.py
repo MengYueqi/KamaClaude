@@ -99,7 +99,10 @@ env_allowlist = ["PATH", "CUSTOM"]
         ('[sandbox]\ntmpfs_mb = 0\n', "sandbox.tmpfs_mb"),
         ('[sandbox]\nnetwork = "false"\n', "sandbox.network"),
         ('[sandbox]\ndocker_image = ""\n', "sandbox.docker_image"),
+        ('[sandbox]\ndocker_image = "   "\n', "sandbox.docker_image"),
         ('[sandbox]\nworkspace_root = 1\n', "sandbox.workspace_root"),
+        ('[sandbox]\nbackend = ["host"]\n', "sandbox.backend"),
+        ('[sandbox]\nbackend = { value = "host" }\n', "sandbox.backend"),
         ('[sandbox]\nenv_allowlist = ["PATH", 1]\n', "sandbox.env_allowlist"),
     ],
 )
@@ -159,6 +162,19 @@ def test_sandbox_network_env_rejects_unknown_boolean_spelling(
     monkeypatch.setenv("KAMA_SANDBOX_NETWORK", "sometimes")
 
     with pytest.raises(SystemExit, match="KAMA_SANDBOX_NETWORK"):
+        get_config()
+
+
+# 功能：拒绝仅含空白的 KAMA_SANDBOX_DOCKER_IMAGE
+# 设计：环境变量走与 TOML 相同的最终验证，避免空白镜像名穿过后端安全边界
+def test_sandbox_docker_image_env_rejects_whitespace_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _clear_sandbox_env(monkeypatch)
+    monkeypatch.setenv("KAMA_SANDBOX_DOCKER_IMAGE", "   ")
+
+    with pytest.raises(SystemExit, match="sandbox.docker_image"):
         get_config()
 
 

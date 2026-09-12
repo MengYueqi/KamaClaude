@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from kama_claude.core.config import SandboxConfig
+from kama_claude.core.sandbox import create_sandbox_backend as package_create_sandbox_backend
 from kama_claude.core.sandbox.factory import create_sandbox_backend
 from kama_claude.core.sandbox.host import HostBackend
 from kama_claude.core.sandbox.workspace import WorkspaceFS
@@ -41,3 +42,9 @@ def test_factory_rejects_unknown_backend(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="unsupported sandbox backend"):
         create_sandbox_backend(SandboxConfig(backend="unknown"), workspace, runtime_dir)
+
+
+# 功能：从 sandbox 包根导入稳定的 factory 接口
+# 设计：断言包级导出与实现模块是同一函数，防止未来重导出包装改变调用语义
+def test_sandbox_package_exports_backend_factory() -> None:
+    assert package_create_sandbox_backend is create_sandbox_backend

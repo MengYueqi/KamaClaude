@@ -372,13 +372,13 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
 
 # 验证沙箱配置的类型和安全边界，并规范化 CPU 数量
 def _validate_sandbox_config(sandbox: SandboxConfig) -> None:
-    if sandbox.backend not in {"host", "docker"}:
+    if not isinstance(sandbox.backend, str) or sandbox.backend not in {"host", "docker"}:
         raise SystemExit("Config error: sandbox.backend must be 'host' or 'docker'")
     if not isinstance(sandbox.workspace_root, str):
         raise SystemExit("Config error: sandbox.workspace_root must be a string")
     if not isinstance(sandbox.network, bool):
         raise SystemExit("Config error: sandbox.network must be a boolean")
-    if not isinstance(sandbox.docker_image, str) or not sandbox.docker_image:
+    if not isinstance(sandbox.docker_image, str) or not sandbox.docker_image.strip():
         raise SystemExit("Config error: sandbox.docker_image must be a non-empty string")
     for key in (
         "timeout_s",
