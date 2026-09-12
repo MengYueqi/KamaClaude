@@ -1219,6 +1219,67 @@ async def test_execute_collector_error_bounds_and_sanitizes_run_wait(
     assert all(task.done() for task in run_process.wait_tasks)
 
 
+# 功能：stdout 缺失的 structured collector error 在同名清理后仍显式收割运行中的 CLI
+# 设计：cleanup 才释放 process.wait，收割成功后保留原 startup-failed 且不遗留 wait task
+async def test_execute_structured_collector_error_reaps_running_docker_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = "6655443322110099"
+    release_wait = asyncio.Event()
+    run_process = _FakeProcess(wait_release=release_wait)
+    run_process.stdout = None
+    cleanup_process = _FakeProcess(on_communicate=release_wait.set)
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> _FakeProcess:
+        calls.append(argv)
+        return run_process if len(calls) == 1 else cleanup_process
+
+    monkeypatch.setattr("kama_claude.core.sandbox.docker.secrets.token_hex", lambda _: token)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    with pytest.raises(SandboxUnavailableError) as caught:
+        await _backend(tmp_path).execute(_request(tmp_path), _limits())
+
+    assert caught.value.reason == "startup-failed"
+    assert calls[1] == ("docker", "rm", "-f", f"kama-{token}")
+    assert run_process.wait_calls == 1
+    assert all(task.done() for task in run_process.wait_tasks)
+
+
+# 功能：structured collector error 后的 run wait 超界时，reap failure 优先且稳定脱敏
+# 设计：wait 只由 deadline 后 kill 释放，最终 cleanup-failed 覆盖 startup-failed 且无 pending task
+async def test_execute_structured_collector_error_prioritizes_reap_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release_wait = asyncio.Event()
+    run_process = _FakeProcess(wait_release=release_wait)
+    run_process.stdout = None
+    cleanup_process = _FakeProcess()
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> _FakeProcess:
+        calls.append(argv)
+        return run_process if len(calls) == 1 else cleanup_process
+
+    monkeypatch.setattr(
+        "kama_claude.core.sandbox.docker._RUN_REAP_TIMEOUT_S", 0.01
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    with pytest.raises(SandboxUnavailableError) as caught:
+        await _backend(tmp_path).execute(
+            _request(tmp_path, "printf STRUCTURED_SECRET"), _limits()
+        )
+
+    assert caught.value.reason == "cleanup-failed"
+    assert "STRUCTURED_SECRET" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert run_process.killed is True
+    assert run_process.wait_calls == 1
+    assert all(task.done() for task in run_process.wait_tasks)
+
+
 # 功能：sandbox 包根稳定导出结构化不可用错误
 # 设计：identity 断言防止 package export 被包装成不同异常类型而破坏捕获契约
 def test_sandbox_package_exports_unavailable_error() -> None:

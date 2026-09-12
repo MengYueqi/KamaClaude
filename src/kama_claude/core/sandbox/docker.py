@@ -300,6 +300,7 @@ class DockerBackend(SandboxBackend):
             communication_failure = SandboxUnavailableError("docker", "cleanup-failed")
         except SandboxUnavailableError as error:
             communication_failure = error
+            needs_process_wait = process.returncode is None
         except asyncio.CancelledError as error:
             communication_failure = error
         except BaseException as error:
