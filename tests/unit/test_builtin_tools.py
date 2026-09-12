@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from kama_claude.core.sandbox import WorkspaceFS, WorkspaceViolationError
 from kama_claude.core.tools.builtin.bash import BashTool
 from kama_claude.core.tools.builtin.list_dir import ListDirTool
 from kama_claude.core.tools.builtin.write_file import WriteFileTool
@@ -53,8 +54,8 @@ async def test_bash_stderr_merged() -> None:
 @pytest.mark.asyncio
 async def test_write_file_creates_and_returns_size(tmp_path: Path) -> None:
     target = tmp_path / "out.txt"
-    result = await WriteFileTool().invoke(
-        {"path": str(target), "content": "hello world"}
+    result = await WriteFileTool(WorkspaceFS(tmp_path)).invoke(
+        {"path": "out.txt", "content": "hello world"}
     )
     assert not result.is_error
     assert "11" in result.content  # "hello world" = 11 bytes
@@ -66,17 +67,34 @@ async def test_write_file_creates_and_returns_size(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_write_file_creates_parent_dirs(tmp_path: Path) -> None:
     target = tmp_path / "a" / "b" / "file.txt"
-    result = await WriteFileTool().invoke({"path": str(target), "content": "x"})
+    result = await WriteFileTool(WorkspaceFS(tmp_path)).invoke(
+        {"path": "a/b/file.txt", "content": "x"}
+    )
     assert not result.is_error
     assert target.exists()
 
 
-# 功能：验证 write_file 拒绝包含 .. 的路径并抛出 PermissionError
-# 设计：.. 路径遍历与 read_file 遵循相同规则，用相同的断言模式保持一致性
+# 功能：验证 write_file 拒绝绝对路径
+# 设计：传入工作区内目标的绝对路径，确保写入仅接受相对于注入工作区的路径
 @pytest.mark.asyncio
-async def test_write_file_rejects_traversal() -> None:
-    with pytest.raises(PermissionError):
-        await WriteFileTool().invoke({"path": "../secret.txt", "content": "x"})
+async def test_write_file_rejects_absolute_path(tmp_path: Path) -> None:
+    with pytest.raises(WorkspaceViolationError):
+        await WriteFileTool(WorkspaceFS(tmp_path)).invoke(
+            {"path": str(tmp_path / "secret.txt"), "content": "x"}
+        )
+
+
+# 功能：验证 write_file 拒绝指向工作区外目录的符号链接
+# 设计：符号链接位于工作区内但目标目录在外部，写入时必须由 WorkspaceFS 拒绝
+@pytest.mark.asyncio
+async def test_write_file_rejects_external_symlink(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside"
+    outside.mkdir(exist_ok=True)
+    (tmp_path / "outside-link").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(WorkspaceViolationError):
+        await WriteFileTool(WorkspaceFS(tmp_path)).invoke(
+            {"path": "outside-link/secret.txt", "content": "x"}
+        )
 
 
 # ── list_dir ──────────────────────────────────────────────────────────────────
@@ -87,7 +105,7 @@ async def test_write_file_rejects_traversal() -> None:
 async def test_list_dir_shows_files(tmp_path: Path) -> None:
     (tmp_path / "foo.py").write_text("x")
     (tmp_path / "bar.md").write_text("y")
-    result = await ListDirTool().invoke({"path": str(tmp_path)})
+    result = await ListDirTool(WorkspaceFS(tmp_path)).invoke({"path": "."})
     assert not result.is_error
     assert "foo.py" in result.content
     assert "bar.md" in result.content
@@ -103,7 +121,7 @@ async def test_list_dir_respects_max_depth(tmp_path: Path) -> None:
     grandchild.mkdir()
     (grandchild / "deep.txt").write_text("x")
 
-    result = await ListDirTool().invoke({"path": str(tmp_path), "max_depth": 1})
+    result = await ListDirTool(WorkspaceFS(tmp_path)).invoke({"path": ".", "max_depth": 1})
     assert not result.is_error
     assert "child" in result.content
     assert "deep.txt" not in result.content
@@ -112,14 +130,43 @@ async def test_list_dir_respects_max_depth(tmp_path: Path) -> None:
 # 功能：验证对不存在的路径 list_dir 抛出 FileNotFoundError
 # 设计：直接传入不存在的路径字符串，预期抛出标准异常（invocation.py 捕获后返回 error ToolResult）
 @pytest.mark.asyncio
-async def test_list_dir_missing_path_raises() -> None:
+async def test_list_dir_missing_path_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
-        await ListDirTool().invoke({"path": "/this/does/not/exist"})
+        await ListDirTool(WorkspaceFS(tmp_path)).invoke({"path": "missing"})
 
 
-# 功能：验证 list_dir 拒绝包含 .. 的路径
-# 设计：与 read_file 和 write_file 保持一致的安全规则
+# 功能：验证 list_dir 拒绝绝对路径
+# 设计：传入工作区根目录的绝对路径，确保枚举仅接受相对于注入工作区的路径
 @pytest.mark.asyncio
-async def test_list_dir_rejects_traversal() -> None:
-    with pytest.raises(PermissionError):
-        await ListDirTool().invoke({"path": "../"})
+async def test_list_dir_rejects_absolute_path(tmp_path: Path) -> None:
+    with pytest.raises(WorkspaceViolationError):
+        await ListDirTool(WorkspaceFS(tmp_path)).invoke({"path": str(tmp_path)})
+
+
+# 功能：验证 list_dir 拒绝指向工作区外目录的符号链接
+# 设计：目录链接自身在工作区内但解析到外部目录，不能借此枚举外部内容
+@pytest.mark.asyncio
+async def test_list_dir_rejects_external_symlink(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside"
+    outside.mkdir(exist_ok=True)
+    (tmp_path / "outside-link").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(WorkspaceViolationError):
+        await ListDirTool(WorkspaceFS(tmp_path)).invoke({"path": "outside-link"})
+
+
+# 功能：验证 list_dir 显示工作区内目录符号链接但不递归进入
+# 设计：链接目标与链接并列于工作区内，断言别名可见而别名路径下不列出目标文件
+@pytest.mark.asyncio
+async def test_list_dir_does_not_recurse_into_internal_directory_symlink(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "nested.txt").write_text("x", encoding="utf-8")
+    (tmp_path / "alias").symlink_to(target, target_is_directory=True)
+
+    result = await ListDirTool(WorkspaceFS(tmp_path)).invoke({"path": ".", "max_depth": 2})
+
+    assert not result.is_error
+    assert "alias/" in result.content
+    assert "alias/\n│   └── nested.txt" not in result.content

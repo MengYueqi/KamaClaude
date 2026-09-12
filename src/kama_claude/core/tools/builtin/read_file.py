@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from pydantic import BaseModel, ConfigDict
 
+from kama_claude.core.sandbox import WorkspaceFS
 from kama_claude.core.tools.base import BaseTool, ToolResult
 
 _MAX_BYTES = 512 * 1024  # 512 KB
@@ -33,14 +32,18 @@ class ReadFileTool(BaseTool):
         "required": ["path"],
     }
 
-    # 读取文件内容；超 512KB 截断；禁止 .. 路径遍历
+    # 注入固定的 WorkspaceFS 以限制文件读取范围
+    def __init__(self, workspace: WorkspaceFS) -> None:
+        self._workspace = workspace
+
+    # 读取工作区内普通文件内容；超 512KB 截断
     async def invoke(self, params: dict[str, object]) -> ToolResult:
-        path_str = ReadFileParams.model_validate(params).path
+        p = ReadFileParams.model_validate(params)
+        path = self._workspace.resolve(p.path, must_exist=True)
 
-        if ".." in Path(path_str).parts:
-            raise PermissionError(f"path traversal not allowed: {path_str}")
+        if not path.is_file():
+            raise IsADirectoryError(f"not a file: {p.path}")
 
-        path = Path(path_str)
         raw = path.read_bytes()  # raises FileNotFoundError if absent
         truncated = len(raw) > _MAX_BYTES
         text = raw[:_MAX_BYTES].decode("utf-8", errors="replace")

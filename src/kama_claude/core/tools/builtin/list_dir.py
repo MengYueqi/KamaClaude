@@ -4,6 +4,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from kama_claude.core.sandbox import WorkspaceFS
 from kama_claude.core.tools.base import BaseTool, ToolResult
 
 _MAX_DEPTH = 4
@@ -40,24 +41,23 @@ class ListDirTool(BaseTool):
         "required": [],
     }
 
-    # 以树状格式列出目录内容，深度和条数有上限
+    # 注入固定的 WorkspaceFS 以限制目录枚举范围
+    def __init__(self, workspace: WorkspaceFS) -> None:
+        self._workspace = workspace
+
+    # 以树状格式列出工作区内目录内容，深度和条数有上限
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = ListDirParams.model_validate(params)
-        path_str = p.path
         max_depth = p.max_depth
+        root = self._workspace.resolve(p.path, must_exist=True)
 
-        if ".." in Path(path_str).parts:
-            raise PermissionError(f"path traversal not allowed: {path_str}")
-
-        root = Path(path_str)
-        if not root.exists():
-            raise FileNotFoundError(f"no such directory: {path_str}")
         if not root.is_dir():
-            raise NotADirectoryError(f"not a directory: {path_str}")
+            raise NotADirectoryError(f"not a directory: {p.path}")
 
         lines: list[str] = [str(root) + "/"]
         count = 0
 
+        # 递归枚举非符号链接目录，避免通过目录链接重复或循环遍历
         def _walk(directory: Path, depth: int, prefix: str) -> None:
             nonlocal count
             if depth > max_depth or count >= _MAX_ENTRIES:
@@ -71,7 +71,7 @@ class ListDirTool(BaseTool):
                 suffix = "/" if entry.is_dir() else ""
                 lines.append(f"{prefix}{connector}{entry.name}{suffix}")
                 count += 1
-                if entry.is_dir() and depth < max_depth:
+                if entry.is_dir() and not entry.is_symlink() and depth < max_depth:
                     extension = "    " if i == len(entries) - 1 else "│   "
                     _walk(entry, depth + 1, prefix + extension)
 
