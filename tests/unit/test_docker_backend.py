@@ -14,6 +14,28 @@ from kama_claude.core.sandbox.models import ExecRequest, SandboxLimits
 from kama_claude.core.sandbox.workspace import WorkspaceFS
 
 
+class _FakeStdout:
+    def __init__(self, process: "_FakeProcess") -> None:
+        self._process = process
+        self._sent = False
+
+    async def read(self, size: int) -> bytes:
+        process = self._process
+        process.started.set()
+        process.process_task = asyncio.current_task()
+        if process.on_communicate is not None:
+            process.on_communicate()
+        if process.release is not None:
+            await process.release.wait()
+        if process.error is not None:
+            raise process.error
+        if self._sent:
+            return b""
+        self._sent = True
+        assert len(process.output) <= size
+        return process.output
+
+
 class _FakeProcess:
     def __init__(
         self,
@@ -33,9 +55,12 @@ class _FakeProcess:
         self.started = asyncio.Event()
         self.communicated = False
         self.killed = False
+        self.process_task: asyncio.Task[Any] | None = None
+        self.stdout = _FakeStdout(self)
 
     async def communicate(self) -> tuple[bytes, None]:
         self.started.set()
+        self.process_task = asyncio.current_task()
         if self.on_communicate is not None:
             self.on_communicate()
         if self.release is not None:
@@ -47,6 +72,12 @@ class _FakeProcess:
             self.returncode = self.final_returncode
         return self.output, None
 
+    async def wait(self) -> int:
+        self.communicated = True
+        if self.returncode is None:
+            self.returncode = self.final_returncode
+        return self.returncode
+
     def kill(self) -> None:
         self.killed = True
         self.returncode = -9
@@ -55,19 +86,14 @@ class _FakeProcess:
 
 
 class _KillErrorProcess(_FakeProcess):
-    def __init__(self, secret: str) -> None:
+    def __init__(self, error: OSError) -> None:
         super().__init__(release=asyncio.Event())
-        self.secret = secret
+        self.kill_error = error
         self.kill_calls = 0
-        self.communicate_task: asyncio.Task[tuple[bytes, None]] | None = None
-
-    async def communicate(self) -> tuple[bytes, None]:
-        self.communicate_task = asyncio.current_task()
-        return await super().communicate()
 
     def kill(self) -> None:
         self.kill_calls += 1
-        raise PermissionError(f"kill denied {self.secret}")
+        raise self.kill_error
 
 
 class _CancellationResistantProcess(_FakeProcess):
@@ -81,11 +107,11 @@ class _CancellationResistantProcess(_FakeProcess):
         self.cancelled_event = asyncio.Event()
         self.finished_event = asyncio.Event()
         self.cancel_count = 0
-        self.communicate_task: asyncio.Task[tuple[bytes, None]] | None = None
+        self.stdout = self
 
-    async def communicate(self) -> tuple[bytes, None]:
+    async def read(self, size: int) -> bytes:
         self.started.set()
-        self.communicate_task = asyncio.current_task()
+        self.process_task = asyncio.current_task()
         while not self.release_stubborn.is_set():
             try:
                 await self.release_stubborn.wait()
@@ -98,13 +124,56 @@ class _CancellationResistantProcess(_FakeProcess):
         self.finished_event.set()
         if self.error is not None:
             raise self.error
-        self.returncode = self.final_returncode
+        return b""
+
+    async def communicate(self) -> tuple[bytes, None]:
+        await self.read(1)
         return self.output, None
 
     def kill(self) -> None:
         self.killed = True
         self.returncode = -9
         self.killed_event.set()
+
+
+class _ChunkStream:
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+        self._index = 0
+        self.read_sizes: list[int] = []
+
+    async def read(self, size: int) -> bytes:
+        self.read_sizes.append(size)
+        await asyncio.sleep(0)
+        if self._index == len(self._chunks):
+            return b""
+        chunk = self._chunks[self._index]
+        self._index += 1
+        assert len(chunk) <= size
+        return chunk
+
+
+class _StreamingProcess:
+    def __init__(self, chunks: list[bytes], returncode: int = 0) -> None:
+        self.stdout = _ChunkStream(chunks)
+        self._all_output = b"".join(chunks)
+        self.final_returncode = returncode
+        self.returncode: int | None = None
+        self.communicate_called = False
+        self.wait_called = False
+
+    async def communicate(self) -> tuple[bytes, None]:
+        self.communicate_called = True
+        self.returncode = self.final_returncode
+        return self._all_output, None
+
+    async def wait(self) -> int:
+        self.wait_called = True
+        self.returncode = self.final_returncode
+        return self.final_returncode
+
+    def kill(self) -> None:
+        self.returncode = -9
 
 
 def _limits(
@@ -283,6 +352,43 @@ async def test_execute_preserves_container_failure_and_truncates_output(
     assert process.communicated is True
 
 
+# 功能：Docker run 输出按固定块持续排空且 retained bytes 始终受 output limit 约束
+# 设计：大量受控 chunks 全部读取，4 字节单调 retained buffer 即峰值，并验证 UTF-8 replacement 与截断
+async def test_execute_streams_all_output_while_retaining_only_the_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chunks = [b"A", b"\xf0", b"\x9f", b"\x92", *([b"zz"] * 1_000)]
+    process = _StreamingProcess(chunks)
+    retained_sizes: list[int] = []
+
+    class TrackingBytearray(bytearray):
+        def extend(self, chunk: bytes) -> None:
+            super().extend(chunk)
+            retained_sizes.append(len(self))
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> _StreamingProcess:
+        return process
+
+    monkeypatch.setattr(
+        "kama_claude.core.sandbox.docker._OUTPUT_CHUNK_BYTES", 3, raising=False
+    )
+    monkeypatch.setattr(
+        "kama_claude.core.sandbox.docker.bytearray", TrackingBytearray, raising=False
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    result = await _backend(tmp_path).execute(
+        _request(tmp_path), _limits(output_limit_bytes=4)
+    )
+
+    assert result.output == "A�"
+    assert result.truncated is True
+    assert retained_sizes and max(retained_sizes) == 4
+    assert process.stdout.read_sizes == [3] * (len(chunks) + 1)
+    assert process.wait_called is True
+    assert process.communicate_called is False
+
+
 # 功能：超时后用相同安全名称强制删除容器并排空原 docker run
 # 设计：cleanup fake 释放 run 输出，证明 rm argv 先执行且原 communicate task 最终被收割
 async def test_execute_timeout_removes_same_container_and_drains_run_output(
@@ -317,6 +423,37 @@ async def test_execute_timeout_removes_same_container_and_drains_run_output(
     assert result.output == "late"
     assert result.timed_out is True
     assert result.truncated is True
+
+
+# 功能：deadline 与 collector 完成竞态按真实完成返回且不误删已由 --rm 移除的容器
+# 设计：wait_for 在取得完成结果后确定性抛 TimeoutError，done task 必须被消费并报告 timed_out=False
+async def test_execute_timeout_race_uses_completed_collection_without_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_process = _FakeProcess(b"completed", 0)
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> _FakeProcess:
+        calls.append(argv)
+        if len(calls) > 1:
+            raise AssertionError("spurious cleanup spawn")
+        return run_process
+
+    async def timeout_after_completion(awaitable: Any, timeout: float) -> Any:
+        await awaitable
+        raise TimeoutError
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(asyncio, "wait_for", timeout_after_completion)
+
+    result = await _backend(tmp_path).execute(_request(tmp_path), _limits())
+
+    assert result.output == "completed"
+    assert result.timed_out is False
+    assert result.truncated is False
+    assert calls[0][:2] == ("docker", "run")
+    assert len(calls) == 1
+    assert run_process.communicated is True
 
 
 # 功能：docker rm communicate 卡住时在有限时间内杀死并收割本地 cleanup CLI
@@ -534,6 +671,57 @@ async def test_execute_preserves_repeated_cancellation_during_kill_reap(
     assert run_process.killed is True
 
 
+# 功能：run collector 的 bounded wait 被取消时，kill OSError 不能覆盖 caller cancellation
+# 设计：同步到 cleanup 后的 run wait 再取消，含 Secret 的 kill 失败仅作 best-effort 内部错误被抑制
+async def test_execute_cancellation_outranks_kill_oserror_during_run_reap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_process = _KillErrorProcess(OSError("kill exposed CANCEL_KILL_SECRET"))
+    cleanup_process = _FakeProcess()
+    entered_run_reap = asyncio.Event()
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> _FakeProcess:
+        calls.append(argv)
+        return run_process if len(calls) == 1 else cleanup_process
+
+    backend = _backend(tmp_path)
+    original_bounded = backend._bounded_process_task
+
+    async def synchronized_bounded(
+        process: Any, process_task: asyncio.Task[Any], timeout_s: float
+    ) -> Any:
+        if process is run_process:
+            entered_run_reap.set()
+        return await original_bounded(process, process_task, timeout_s)
+
+    monkeypatch.setattr(
+        "kama_claude.core.sandbox.docker._KILL_REAP_TIMEOUT_S", 0.01
+    )
+    monkeypatch.setattr(
+        "kama_claude.core.sandbox.docker._TASK_CANCEL_TIMEOUT_S", 0.01
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(backend, "_bounded_process_task", synchronized_bounded)
+    task = asyncio.create_task(
+        backend.execute(_request(tmp_path), _limits(timeout_s=1))
+    )
+
+    try:
+        await asyncio.wait_for(entered_run_reap.wait(), timeout=2.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        assert run_process.release is not None
+        run_process.release.set()
+        await asyncio.sleep(0)
+
+    assert run_process.kill_calls == 1
+    assert run_process.process_task is not None
+    assert run_process.process_task.done() or run_process.process_task in backend._detached_tasks
+
+
 # 功能：communicate 持续抗取消时 execute 仍有界返回且最终异常被安全消费
 # 设计：硬 deadline 后强引用 detached task；释放后 callback 必须取走 Secret 异常并自动移除引用
 async def test_execute_detaches_cancellation_resistant_communication_with_callback(
@@ -579,13 +767,13 @@ async def test_execute_detaches_cancellation_resistant_communication_with_callba
             await task
         assert completed_within_bound
         assert caught.value.reason == "cleanup-failed"
-        assert run_process.communicate_task is not None
-        assert run_process.communicate_task in backend._detached_tasks
+        assert run_process.process_task is not None
+        assert run_process.process_task in backend._detached_tasks
 
         run_process.release_stubborn.set()
         await asyncio.wait_for(run_process.finished_event.wait(), timeout=0.5)
         await asyncio.sleep(0)
-        assert run_process.communicate_task.done()
+        assert run_process.process_task.done()
         assert not backend._detached_tasks
         assert unhandled == []
     finally:
@@ -655,7 +843,7 @@ async def test_execute_sanitizes_cleanup_spawn_failure(
 async def test_execute_sanitizes_kill_failure_and_disposes_communication_task(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    run_process = _KillErrorProcess("KILL_SECRET")
+    run_process = _KillErrorProcess(PermissionError("kill denied KILL_SECRET"))
     cleanup_process = _FakeProcess()
     calls: list[tuple[str, ...]] = []
 
@@ -684,8 +872,8 @@ async def test_execute_sanitizes_kill_failure_and_disposes_communication_task(
     assert "KILL_SECRET" not in str(caught.value)
     assert caught.value.__cause__ is None
     assert run_process.kill_calls == 1
-    assert run_process.communicate_task is not None
-    assert run_process.communicate_task.done() or run_process.communicate_task in backend._detached_tasks
+    assert run_process.process_task is not None
+    assert run_process.process_task.done() or run_process.process_task in backend._detached_tasks
 
 
 # 功能：Docker run 的保留退出码 125 转换为不可用错误
