@@ -9,8 +9,10 @@ import pytest
 
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, UsageStats
+from kama_claude.core.sandbox import WorkspaceFS
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.subagent.tool import AgentResultTool, SpawnAgentTool
+from kama_claude.core.tools.builtin import ListDirTool, ReadFileTool, WriteFileTool
 
 
 def _make_provider(result_text: str = "child done") -> Any:
@@ -36,6 +38,7 @@ def _make_tool(
     tmp_path: Path,
     provider: Any = None,
     depth: int = 0,
+    workspace: WorkspaceFS | None = None,
 ) -> tuple[SpawnAgentTool, BackgroundTaskRegistry, EventBus]:
     bus = EventBus()
     registry = BackgroundTaskRegistry()
@@ -48,6 +51,7 @@ def _make_tool(
         task_registry=registry,
         runs_dir=tmp_path,
         session_id="sess-test",
+        workspace=workspace or WorkspaceFS(tmp_path),
         depth=depth,
     )
     return tool, registry, bus
@@ -189,3 +193,37 @@ async def test_foreground_publishes_started_event(tmp_path: Path) -> None:
     assert len(started) == 1
     assert started[0].parent_run_id == "parent-run-01"
     assert started[0].description == "test task"
+
+
+# 功能：验证子和嵌套 registry 的文件工具继承同一个 WorkspaceFS 实例
+# 设计：直接构建两层 registry，检查实际注册的三种文件工具及嵌套 SpawnAgentTool 的对象身份
+def test_child_and_nested_registries_share_workspace(tmp_path: Path) -> None:
+    workspace = WorkspaceFS(tmp_path)
+    tool, _, _ = _make_tool(tmp_path, workspace=workspace)
+
+    child_registry = tool._build_child_registry(EventBus(), "child-run", None)
+    child_read = child_registry.get("read_file")
+    child_write = child_registry.get("write_file")
+    child_list = child_registry.get("list_dir")
+    nested_tool = child_registry.get("spawn_agent")
+
+    assert isinstance(child_read, ReadFileTool)
+    assert isinstance(child_write, WriteFileTool)
+    assert isinstance(child_list, ListDirTool)
+    assert isinstance(nested_tool, SpawnAgentTool)
+    assert child_read._workspace is workspace
+    assert child_write._workspace is workspace
+    assert child_list._workspace is workspace
+    assert nested_tool._workspace is workspace
+
+    nested_registry = nested_tool._build_child_registry(EventBus(), "nested-run", None)
+    nested_read = nested_registry.get("read_file")
+    nested_write = nested_registry.get("write_file")
+    nested_list = nested_registry.get("list_dir")
+
+    assert isinstance(nested_read, ReadFileTool)
+    assert isinstance(nested_write, WriteFileTool)
+    assert isinstance(nested_list, ListDirTool)
+    assert nested_read._workspace is workspace
+    assert nested_write._workspace is workspace
+    assert nested_list._workspace is workspace

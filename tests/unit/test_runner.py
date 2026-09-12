@@ -9,6 +9,9 @@ from kama_claude.core.config import KamaConfig
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
 from kama_claude.core.runner import AgentRunner
+from kama_claude.core.sandbox import WorkspaceFS
+from kama_claude.core.task.manager import TaskManager
+from kama_claude.core.tools.builtin import ListDirTool, ReadFileTool, WriteFileTool
 
 # --- mock provider -----------------------------------------------------------
 
@@ -127,6 +130,32 @@ async def test_run_finished_event_published_on_success(tmp_path: Path) -> None:
     )
     assert finished is not None
     assert finished.status == "success"  # type: ignore[attr-defined]
+
+
+# 功能：验证注入 WorkspaceFS 后 Runner 能完成运行且主文件工具共享该实例
+# 设计：运行实际 AgentLoop 成功路径，并从构建后的 registry 验证三种文件工具的工作区对象身份
+async def test_runner_uses_injected_workspace_for_run_and_registry(tmp_path: Path) -> None:
+    workspace = WorkspaceFS(tmp_path)
+    runner = AgentRunner(
+        _config(),
+        provider=_EndTurnProvider(),  # type: ignore[arg-type]
+        runs_dir=tmp_path / "runs",
+        workspace=workspace,
+    )
+
+    outcome = await runner.run_and_capture("goal")
+    registry = runner._build_registry(TaskManager(tmp_path / "tasks"))
+    read_tool = registry.get("read_file")
+    write_tool = registry.get("write_file")
+    list_tool = registry.get("list_dir")
+
+    assert outcome.status == "success"
+    assert isinstance(read_tool, ReadFileTool)
+    assert isinstance(write_tool, WriteFileTool)
+    assert isinstance(list_tool, ListDirTool)
+    assert read_tool._workspace is workspace
+    assert write_tool._workspace is workspace
+    assert list_tool._workspace is workspace
 
 
 # 功能：验证步数耗尽时 run.finished 携带 failed 状态和正确的失败原因

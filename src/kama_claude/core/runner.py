@@ -19,6 +19,7 @@ from kama_claude.core.mcp.server import McpServerManager
 from kama_claude.core.memory.loader import load_context_file
 from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.runs import RUNS_DIR, new_run_id
+from kama_claude.core.sandbox import WorkspaceFS
 from kama_claude.core.session.model import Session
 from kama_claude.core.session.store import SessionStore
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
@@ -64,6 +65,7 @@ class AgentRunner:
         trace: TraceWriter | None = None,
         permission_manager: PermissionManager | None = None,
         mcp_manager: McpServerManager | None = None,
+        workspace: WorkspaceFS | None = None,
     ) -> None:
         self._config = config
         self._bus = bus
@@ -73,6 +75,7 @@ class AgentRunner:
         self._trace = trace
         self._permission_manager = permission_manager
         self._mcp_manager = mcp_manager
+        self._workspace = workspace or WorkspaceFS(Path.cwd())
         # 跨 run 共享的后台 subagent 任务注册表
         self._task_registry = BackgroundTaskRegistry()
 
@@ -96,7 +99,12 @@ class AgentRunner:
             return allowed is None or name in allowed
 
         registry = ToolRegistry()
-        for t in [ReadFileTool(), BashTool(), WriteFileTool(), ListDirTool()]:
+        for t in [
+            ReadFileTool(self._workspace),
+            BashTool(),
+            WriteFileTool(self._workspace),
+            ListDirTool(self._workspace),
+        ]:
             if _ok(t.name):
                 registry.register(t)
         for t in [
@@ -124,6 +132,7 @@ class AgentRunner:
                         task_registry=self._task_registry,
                         runs_dir=runs_dir,
                         session_id=session_id,
+                        workspace=self._workspace,
                         depth=0,
                     )
                 )
