@@ -3,12 +3,21 @@
 import asyncio
 import os
 import secrets
+from contextlib import suppress
 from pathlib import Path
 
 from kama_claude.core.sandbox.base import SandboxBackend
 from kama_claude.core.sandbox.errors import SandboxUnavailableError
 from kama_claude.core.sandbox.models import ExecRequest, ExecResult, SandboxLimits
 from kama_claude.core.sandbox.workspace import WorkspaceFS
+
+_CLEANUP_TIMEOUT_S = 5.0
+_RUN_REAP_TIMEOUT_S = 2.0
+_KILL_REAP_TIMEOUT_S = 1.0
+
+
+class _ProcessTimeoutError(TimeoutError):
+    """Internal signal that a local Docker CLI exceeded its lifecycle bound."""
 
 
 class DockerBackend(SandboxBackend):
@@ -86,51 +95,114 @@ class DockerBackend(SandboxBackend):
                 b"cannot connect to the docker daemon",
                 b"error during connect",
                 b"is the docker daemon running",
+                b"permission denied while trying to connect to the docker api",
             )
         )
+
+    # 杀死仍存活的本地 Docker CLI，并以有限等待加最终任务取消完成收割
+    @staticmethod
+    async def _kill_and_reap(
+        process: asyncio.subprocess.Process,
+        communicate_task: asyncio.Task[tuple[bytes, bytes | None]],
+    ) -> None:
+        if process.returncode is None:
+            with suppress(ProcessLookupError):
+                process.kill()
+        if communicate_task.done():
+            with suppress(BaseException):
+                communicate_task.result()
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(communicate_task), timeout=_KILL_REAP_TIMEOUT_S
+            )
+        except BaseException:
+            if not communicate_task.done():
+                communicate_task.cancel()
+            with suppress(BaseException):
+                await communicate_task
+
+    # 在正数 deadline 内排空本地 CLI，超界时先 kill 再确保通信任务结束
+    async def _bounded_communicate(
+        self,
+        process: asyncio.subprocess.Process,
+        communicate_task: asyncio.Task[tuple[bytes, bytes | None]],
+        timeout_s: float,
+    ) -> tuple[bytes, bytes | None]:
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(communicate_task), timeout=timeout_s
+            )
+        except asyncio.CancelledError:
+            await self._kill_and_reap(process, communicate_task)
+            raise
+        except TimeoutError:
+            if communicate_task.done():
+                return communicate_task.result()
+            await self._kill_and_reap(process, communicate_task)
+            raise _ProcessTimeoutError from None
 
     # 通过独立 argv 命令强制删除指定容器并收割清理进程
     async def _remove_container(self, container_name: str) -> None:
         try:
-            cleanup = await asyncio.create_subprocess_exec(
-                "docker",
-                "rm",
-                "-f",
-                container_name,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+            cleanup = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    "docker",
+                    "rm",
+                    "-f",
+                    container_name,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                ),
+                timeout=_CLEANUP_TIMEOUT_S,
             )
-        except FileNotFoundError:
-            raise SandboxUnavailableError("docker", "cli-not-found") from None
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            raise SandboxUnavailableError("docker", "cleanup-failed") from None
         cleanup_task = asyncio.create_task(cleanup.communicate())
         try:
-            await asyncio.shield(cleanup_task)
-        except BaseException:
-            if not cleanup_task.done():
-                await asyncio.shield(cleanup_task)
+            await self._bounded_communicate(cleanup, cleanup_task, _CLEANUP_TIMEOUT_S)
+        except asyncio.CancelledError:
             raise
+        except BaseException:
+            await self._kill_and_reap(cleanup, cleanup_task)
+            raise SandboxUnavailableError("docker", "cleanup-failed") from None
         if cleanup.returncode != 0:
             raise SandboxUnavailableError("docker", "cleanup-failed")
 
     # 删除活动容器后排空原 docker run，确保通信任务不会遗留
     async def _remove_and_collect(
         self,
+        process: asyncio.subprocess.Process,
         communicate_task: asyncio.Task[tuple[bytes, bytes | None]],
         container_name: str,
     ) -> tuple[bytes, bytes | None]:
         cleanup_failure: BaseException | None = None
+        communication_failure: BaseException | None = None
+        result: tuple[bytes, bytes | None] | None = None
         try:
             await self._remove_container(container_name)
         except BaseException as error:
             cleanup_failure = error
         try:
-            result = await asyncio.shield(communicate_task)
-        except BaseException:
-            if cleanup_failure is not None:
-                raise cleanup_failure
-            raise
+            result = await self._bounded_communicate(
+                process, communicate_task, _RUN_REAP_TIMEOUT_S
+            )
+        except _ProcessTimeoutError:
+            communication_failure = SandboxUnavailableError("docker", "cleanup-failed")
+        except BaseException as error:
+            await self._kill_and_reap(process, communicate_task)
+            communication_failure = error
+        if isinstance(cleanup_failure, asyncio.CancelledError):
+            raise cleanup_failure
+        if isinstance(communication_failure, asyncio.CancelledError):
+            raise communication_failure
         if cleanup_failure is not None:
             raise cleanup_failure
+        if communication_failure is not None:
+            raise communication_failure
+        assert result is not None
         return result
 
     # 在隔离容器中执行请求并标准化输出、超时与后端不可用错误
@@ -155,11 +227,21 @@ class DockerBackend(SandboxBackend):
         except TimeoutError:
             timed_out = True
             output_bytes, _ = await self._remove_and_collect(
-                communicate_task, container_name
+                process, communicate_task, container_name
             )
+        except asyncio.CancelledError:
+            if communicate_task.done():
+                with suppress(BaseException):
+                    communicate_task.result()
+            else:
+                with suppress(BaseException):
+                    await self._remove_and_collect(
+                        process, communicate_task, container_name
+                    )
+            raise
         except BaseException:
             if not communicate_task.done():
-                await self._remove_and_collect(communicate_task, container_name)
+                await self._remove_and_collect(process, communicate_task, container_name)
             else:
                 await self._remove_container(container_name)
             raise
