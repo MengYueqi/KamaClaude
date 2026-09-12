@@ -101,3 +101,9 @@ def test_relative_rejects_outside_path(tmp_path: Path) -> None:
     outside.mkdir()
     with pytest.raises(WorkspaceViolationError, match="outside workspace"):
         workspace.relative(outside)
+
+
+# 功能：Workspace 越界错误保持标准权限错误语义
+# 设计：继承回归防止调用方的 PermissionError 捕获因错误基类变化而失效
+def test_workspace_violation_error_is_permission_error() -> None:
+    assert issubclass(WorkspaceViolationError, PermissionError)
