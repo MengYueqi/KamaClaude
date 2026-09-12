@@ -14,6 +14,7 @@ from kama_claude.core.sandbox.workspace import WorkspaceFS
 _CLEANUP_TIMEOUT_S = 5.0
 _RUN_REAP_TIMEOUT_S = 2.0
 _KILL_REAP_TIMEOUT_S = 1.0
+_TASK_CANCEL_TIMEOUT_S = 1.0
 
 
 class _ProcessTimeoutError(TimeoutError):
@@ -30,6 +31,9 @@ class DockerBackend(SandboxBackend):
         self._workspace = workspace
         self._image = image
         self._network = network
+        self._detached_tasks: set[
+            asyncio.Task[tuple[bytes, bytes | None]]
+        ] = set()
 
     # 返回强隔离后端的稳定名称
     @property
@@ -99,28 +103,75 @@ class DockerBackend(SandboxBackend):
             )
         )
 
-    # 杀死仍存活的本地 Docker CLI，并以有限等待加最终任务取消完成收割
-    @staticmethod
+    # 消费已结束 detached task 的结果并释放 backend 持有的强引用
+    def _consume_detached_task(
+        self, task: asyncio.Task[tuple[bytes, bytes | None]]
+    ) -> None:
+        with suppress(BaseException):
+            task.result()
+        self._detached_tasks.discard(task)
+
+    # 强引用仍抗取消的通信任务，并注册绝不抛错的完成回调
+    def _detach_communicate_task(
+        self, task: asyncio.Task[tuple[bytes, bytes | None]]
+    ) -> None:
+        if task.done():
+            self._consume_detached_task(task)
+            return
+        self._detached_tasks.add(task)
+        task.add_done_callback(self._consume_detached_task)
+
+    # 单次尝试杀死本地 Docker CLI，并以两段硬期限处置或监管通信任务
     async def _kill_and_reap(
+        self,
         process: asyncio.subprocess.Process,
         communicate_task: asyncio.Task[tuple[bytes, bytes | None]],
     ) -> None:
+        kill_failed = False
         if process.returncode is None:
-            with suppress(ProcessLookupError):
+            try:
                 process.kill()
+            except ProcessLookupError:
+                pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                kill_failed = True
         if communicate_task.done():
             with suppress(BaseException):
                 communicate_task.result()
-            return
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(communicate_task), timeout=_KILL_REAP_TIMEOUT_S
-            )
-        except BaseException:
-            if not communicate_task.done():
+        else:
+            try:
+                done, _ = await asyncio.wait(
+                    {communicate_task}, timeout=_KILL_REAP_TIMEOUT_S
+                )
+            except asyncio.CancelledError:
+                if not communicate_task.done():
+                    communicate_task.cancel()
+                    self._detach_communicate_task(communicate_task)
+                raise
+            if done:
+                with suppress(BaseException):
+                    communicate_task.result()
+            else:
                 communicate_task.cancel()
-            with suppress(BaseException):
-                await communicate_task
+                try:
+                    done, _ = await asyncio.wait(
+                        {communicate_task}, timeout=_TASK_CANCEL_TIMEOUT_S
+                    )
+                except asyncio.CancelledError:
+                    if not communicate_task.done():
+                        communicate_task.cancel()
+                        self._detach_communicate_task(communicate_task)
+                    raise
+                if done:
+                    with suppress(BaseException):
+                        communicate_task.result()
+                else:
+                    communicate_task.cancel()
+                    self._detach_communicate_task(communicate_task)
+        if kill_failed:
+            raise SandboxUnavailableError("docker", "cleanup-failed") from None
 
     # 在正数 deadline 内排空本地 CLI，超界时先 kill 再确保通信任务结束
     async def _bounded_communicate(
@@ -165,6 +216,8 @@ class DockerBackend(SandboxBackend):
             await self._bounded_communicate(cleanup, cleanup_task, _CLEANUP_TIMEOUT_S)
         except asyncio.CancelledError:
             raise
+        except SandboxUnavailableError:
+            raise
         except BaseException:
             await self._kill_and_reap(cleanup, cleanup_task)
             raise SandboxUnavailableError("docker", "cleanup-failed") from None
@@ -191,9 +244,17 @@ class DockerBackend(SandboxBackend):
             )
         except _ProcessTimeoutError:
             communication_failure = SandboxUnavailableError("docker", "cleanup-failed")
-        except BaseException as error:
-            await self._kill_and_reap(process, communicate_task)
+        except SandboxUnavailableError as error:
             communication_failure = error
+        except asyncio.CancelledError as error:
+            communication_failure = error
+        except BaseException as error:
+            try:
+                await self._kill_and_reap(process, communicate_task)
+            except SandboxUnavailableError as kill_failure:
+                communication_failure = kill_failure
+            else:
+                communication_failure = error
         if isinstance(cleanup_failure, asyncio.CancelledError):
             raise cleanup_failure
         if isinstance(communication_failure, asyncio.CancelledError):

@@ -1,6 +1,7 @@
 import asyncio
 import os
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,59 @@ class _FakeProcess:
         self.returncode = -9
         if self.release is not None:
             self.release.set()
+
+
+class _KillErrorProcess(_FakeProcess):
+    def __init__(self, secret: str) -> None:
+        super().__init__(release=asyncio.Event())
+        self.secret = secret
+        self.kill_calls = 0
+        self.communicate_task: asyncio.Task[tuple[bytes, None]] | None = None
+
+    async def communicate(self) -> tuple[bytes, None]:
+        self.communicate_task = asyncio.current_task()
+        return await super().communicate()
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        raise PermissionError(f"kill denied {self.secret}")
+
+
+class _CancellationResistantProcess(_FakeProcess):
+    def __init__(
+        self, *, ignored_cancellations: int, error: BaseException | None = None
+    ) -> None:
+        super().__init__(error=error)
+        self.ignored_cancellations = ignored_cancellations
+        self.release_stubborn = asyncio.Event()
+        self.killed_event = asyncio.Event()
+        self.cancelled_event = asyncio.Event()
+        self.finished_event = asyncio.Event()
+        self.cancel_count = 0
+        self.communicate_task: asyncio.Task[tuple[bytes, None]] | None = None
+
+    async def communicate(self) -> tuple[bytes, None]:
+        self.started.set()
+        self.communicate_task = asyncio.current_task()
+        while not self.release_stubborn.is_set():
+            try:
+                await self.release_stubborn.wait()
+            except asyncio.CancelledError:
+                self.cancel_count += 1
+                self.cancelled_event.set()
+                if self.cancel_count > self.ignored_cancellations:
+                    raise
+        self.communicated = True
+        self.finished_event.set()
+        if self.error is not None:
+            raise self.error
+        self.returncode = self.final_returncode
+        return self.output, None
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+        self.killed_event.set()
 
 
 def _limits(
@@ -439,6 +493,109 @@ async def test_execute_cancellation_after_run_completion_skips_cleanup(
     assert run_process.communicated is True
 
 
+# 功能：kill/reap 等待期间的重复取消始终以 caller CancelledError 为最高优先级
+# 设计：首个外层取消命中 reap wait，communicate 抗一次取消后再次取消，禁止降级为 cleanup-failed
+async def test_execute_preserves_repeated_cancellation_during_kill_reap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_process = _CancellationResistantProcess(ignored_cancellations=1)
+    cleanup_process = _FakeProcess()
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> _FakeProcess:
+        calls.append(argv)
+        return run_process if len(calls) == 1 else cleanup_process
+
+    monkeypatch.setattr(
+        "kama_claude.core.sandbox.docker._RUN_REAP_TIMEOUT_S", 0.01
+    )
+    monkeypatch.setattr(
+        "kama_claude.core.sandbox.docker._KILL_REAP_TIMEOUT_S", 1.0
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    task = asyncio.create_task(
+        _backend(tmp_path).execute(_request(tmp_path), _limits(timeout_s=1))
+    )
+
+    await asyncio.wait_for(run_process.killed_event.wait(), timeout=2.0)
+    fallback = asyncio.get_running_loop().call_later(0.20, run_process.release_stubborn.set)
+    try:
+        assert task.cancel()
+        assert task.cancel()
+        await asyncio.wait_for(run_process.cancelled_event.wait(), timeout=0.5)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        fallback.cancel()
+        run_process.release_stubborn.set()
+        await asyncio.sleep(0)
+
+    assert task.cancelled()
+    assert run_process.killed is True
+
+
+# 功能：communicate 持续抗取消时 execute 仍有界返回且最终异常被安全消费
+# 设计：硬 deadline 后强引用 detached task；释放后 callback 必须取走 Secret 异常并自动移除引用
+async def test_execute_detaches_cancellation_resistant_communication_with_callback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_process = _CancellationResistantProcess(
+        ignored_cancellations=10,
+        error=RuntimeError("detached communicate exposed DETACHED_SECRET"),
+    )
+    cleanup_process = _FakeProcess()
+    calls: list[tuple[str, ...]] = []
+    unhandled: list[dict[str, Any]] = []
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> _FakeProcess:
+        calls.append(argv)
+        return run_process if len(calls) == 1 else cleanup_process
+
+    monkeypatch.setattr(
+        "kama_claude.core.sandbox.docker._RUN_REAP_TIMEOUT_S", 0.01
+    )
+    monkeypatch.setattr(
+        "kama_claude.core.sandbox.docker._KILL_REAP_TIMEOUT_S", 0.01
+    )
+    monkeypatch.setattr(
+        "kama_claude.core.sandbox.docker._TASK_CANCEL_TIMEOUT_S", 0.01, raising=False
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    backend = _backend(tmp_path)
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+    task = asyncio.create_task(
+        backend.execute(_request(tmp_path), _limits(timeout_s=1))
+    )
+
+    try:
+        await asyncio.wait_for(run_process.killed_event.wait(), timeout=2.0)
+        done, _ = await asyncio.wait({task}, timeout=0.08)
+        completed_within_bound = task in done
+        if not completed_within_bound:
+            run_process.release_stubborn.set()
+        with pytest.raises(SandboxUnavailableError) as caught:
+            await task
+        assert completed_within_bound
+        assert caught.value.reason == "cleanup-failed"
+        assert run_process.communicate_task is not None
+        assert run_process.communicate_task in backend._detached_tasks
+
+        run_process.release_stubborn.set()
+        await asyncio.wait_for(run_process.finished_event.wait(), timeout=0.5)
+        await asyncio.sleep(0)
+        assert run_process.communicate_task.done()
+        assert not backend._detached_tasks
+        assert unhandled == []
+    finally:
+        run_process.release_stubborn.set()
+        if not task.done():
+            with suppress(BaseException):
+                await task
+        loop.set_exception_handler(previous_handler)
+
+
 # 功能：Docker CLI 缺失转换为结构化 unavailable 错误且不回退 Host
 # 设计：在唯一外部边界抛 FileNotFoundError，断言公开错误类型与脱敏后的稳定字段
 async def test_execute_reports_missing_docker_cli_without_fallback_or_secret_leak(
@@ -491,6 +648,44 @@ async def test_execute_sanitizes_cleanup_spawn_failure(
     assert caught.value.__cause__ is None
     assert run_process.killed is True
     assert run_process.communicated is True
+
+
+# 功能：本地 Docker CLI kill 失败时仍脱敏错误并安全处置 communicate task
+# 设计：含 Secret 的 PermissionError 不得成为 cause 或二次 kill 逃逸，task 必须完成或受强引用回调监管
+async def test_execute_sanitizes_kill_failure_and_disposes_communication_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_process = _KillErrorProcess("KILL_SECRET")
+    cleanup_process = _FakeProcess()
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> _FakeProcess:
+        calls.append(argv)
+        return run_process if len(calls) == 1 else cleanup_process
+
+    monkeypatch.setattr(
+        "kama_claude.core.sandbox.docker._RUN_REAP_TIMEOUT_S", 0.01
+    )
+    monkeypatch.setattr(
+        "kama_claude.core.sandbox.docker._KILL_REAP_TIMEOUT_S", 0.01
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    backend = _backend(tmp_path)
+
+    try:
+        with pytest.raises(SandboxUnavailableError) as caught:
+            await backend.execute(_request(tmp_path), _limits(timeout_s=1))
+    finally:
+        assert run_process.release is not None
+        run_process.release.set()
+        await asyncio.sleep(0)
+
+    assert caught.value.reason == "cleanup-failed"
+    assert "KILL_SECRET" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert run_process.kill_calls == 1
+    assert run_process.communicate_task is not None
+    assert run_process.communicate_task.done() or run_process.communicate_task in backend._detached_tasks
 
 
 # 功能：Docker run 的保留退出码 125 转换为不可用错误
