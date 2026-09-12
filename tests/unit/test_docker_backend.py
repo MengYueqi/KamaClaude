@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from kama_claude.core.sandbox import SandboxUnavailableError
-from kama_claude.core.sandbox.docker import DockerBackend
+from kama_claude.core.sandbox.docker import DockerBackend, _RunOutput
 from kama_claude.core.sandbox.errors import SandboxUnavailableError as DirectUnavailableError
 from kama_claude.core.sandbox.models import ExecRequest, SandboxLimits
 from kama_claude.core.sandbox.workspace import WorkspaceFS
@@ -43,6 +43,7 @@ class _FakeProcess:
         returncode: int = 0,
         *,
         release: asyncio.Event | None = None,
+        wait_release: asyncio.Event | None = None,
         on_communicate: Callable[[], None] | None = None,
         error: BaseException | None = None,
     ) -> None:
@@ -50,12 +51,15 @@ class _FakeProcess:
         self.final_returncode = returncode
         self.returncode: int | None = None
         self.release = release
+        self.wait_release = wait_release
         self.on_communicate = on_communicate
         self.error = error
         self.started = asyncio.Event()
         self.communicated = False
         self.killed = False
         self.process_task: asyncio.Task[Any] | None = None
+        self.wait_tasks: list[asyncio.Task[Any]] = []
+        self.wait_calls = 0
         self.stdout = _FakeStdout(self)
 
     async def communicate(self) -> tuple[bytes, None]:
@@ -73,6 +77,12 @@ class _FakeProcess:
         return self.output, None
 
     async def wait(self) -> int:
+        self.wait_calls += 1
+        current_task = asyncio.current_task()
+        assert current_task is not None
+        self.wait_tasks.append(current_task)
+        if self.wait_release is not None:
+            await self.wait_release.wait()
         self.communicated = True
         if self.returncode is None:
             self.returncode = self.final_returncode
@@ -83,6 +93,8 @@ class _FakeProcess:
         self.returncode = -9
         if self.release is not None:
             self.release.set()
+        if self.wait_release is not None:
+            self.wait_release.set()
 
 
 class _KillErrorProcess(_FakeProcess):
@@ -456,6 +468,51 @@ async def test_execute_timeout_race_uses_completed_collection_without_cleanup(
     assert run_process.communicated is True
 
 
+# 功能：collector 已完成但 Docker CLI 仍运行时，timeout 竞态必须同名清理并显式收割进程
+# 设计：让 collector 提前返回且 process.returncode 保持 None，防止仅凭 task.done() 跳过 rm/wait
+async def test_execute_timeout_race_cleans_completed_collector_when_process_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = "9988776655443322"
+    run_process = _FakeProcess()
+    cleanup_process = _FakeProcess()
+    calls: list[tuple[str, ...]] = []
+    wait_for_calls = 0
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> _FakeProcess:
+        calls.append(argv)
+        return run_process if len(calls) == 1 else cleanup_process
+
+    async def completed_collector(
+        process: Any, output_limit_bytes: int
+    ) -> _RunOutput:
+        return _RunOutput(b"completed", False)
+
+    original_wait_for = asyncio.wait_for
+
+    async def timeout_after_collection(awaitable: Any, timeout: float) -> Any:
+        nonlocal wait_for_calls
+        wait_for_calls += 1
+        if wait_for_calls == 1:
+            await awaitable
+            raise TimeoutError
+        return await original_wait_for(awaitable, timeout)
+
+    backend = _backend(tmp_path)
+    monkeypatch.setattr("kama_claude.core.sandbox.docker.secrets.token_hex", lambda _: token)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(asyncio, "wait_for", timeout_after_collection)
+    monkeypatch.setattr(backend, "_collect_run_output", completed_collector)
+
+    result = await backend.execute(_request(tmp_path), _limits())
+
+    assert calls[1] == ("docker", "rm", "-f", f"kama-{token}")
+    assert run_process.wait_calls == 1
+    assert all(task.done() for task in run_process.wait_tasks)
+    assert result.output == "completed"
+    assert result.timed_out is True
+
+
 # 功能：docker rm communicate 卡住时在有限时间内杀死并收割本地 cleanup CLI
 # 设计：fallback 定时释放防止旧实现挂住；新实现必须先命中私有正数 deadline 并返回脱敏错误
 async def test_execute_bounds_hung_cleanup_process(
@@ -628,6 +685,57 @@ async def test_execute_cancellation_after_run_completion_skips_cleanup(
 
     assert len(calls) == 1
     assert run_process.communicated is True
+
+
+# 功能：collector 已完成但进程仍运行时，caller cancellation 必须先清理收割再传播
+# 设计：取消发生在提前完成 collector 的结果门闩内，是否 rm 只能依据 process.returncode
+async def test_execute_cancellation_race_cleans_when_process_still_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = "8877665544332211"
+    run_process = _FakeProcess()
+    cleanup_process = _FakeProcess()
+    collection_complete = asyncio.Event()
+    hold_result = asyncio.Event()
+    calls: list[tuple[str, ...]] = []
+    wait_for_calls = 0
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> _FakeProcess:
+        calls.append(argv)
+        return run_process if len(calls) == 1 else cleanup_process
+
+    async def completed_collector(
+        process: Any, output_limit_bytes: int
+    ) -> _RunOutput:
+        return _RunOutput(b"completed", False)
+
+    original_wait_for = asyncio.wait_for
+
+    async def gated_wait_for(awaitable: Any, timeout: float) -> Any:
+        nonlocal wait_for_calls
+        wait_for_calls += 1
+        if wait_for_calls == 1:
+            result = await awaitable
+            collection_complete.set()
+            await hold_result.wait()
+            return result
+        return await original_wait_for(awaitable, timeout)
+
+    backend = _backend(tmp_path)
+    monkeypatch.setattr("kama_claude.core.sandbox.docker.secrets.token_hex", lambda _: token)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(asyncio, "wait_for", gated_wait_for)
+    monkeypatch.setattr(backend, "_collect_run_output", completed_collector)
+    task = asyncio.create_task(backend.execute(_request(tmp_path), _limits()))
+    await collection_complete.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert calls[1] == ("docker", "rm", "-f", f"kama-{token}")
+    assert run_process.wait_calls == 1
+    assert all(wait_task.done() for wait_task in run_process.wait_tasks)
 
 
 # 功能：kill/reap 等待期间的重复取消始终以 caller CancelledError 为最高优先级
@@ -805,6 +913,41 @@ async def test_execute_reports_missing_docker_cli_without_fallback_or_secret_lea
     assert caught.value.__cause__ is None
 
 
+# 功能：Docker run spawn 的宿主 OSError 统一转换为稳定且结构化的 unavailable 错误
+# 设计：PermissionError 与一般 OSError 的 Secret/path 均不得出现在消息或异常 cause 中
+@pytest.mark.parametrize(
+    "spawn_error",
+    [
+        PermissionError("docker denied /private/SECRET_SOCKET"),
+        OSError("docker spawn exposed SECRET_PATH"),
+    ],
+    ids=["permission-error", "os-error"],
+)
+async def test_execute_sanitizes_docker_run_spawn_oserror(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    spawn_error: OSError,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    async def failing_exec(*argv: str, **kwargs: Any) -> _FakeProcess:
+        calls.append(argv)
+        raise spawn_error
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", failing_exec)
+
+    with pytest.raises(SandboxUnavailableError) as caught:
+        await _backend(tmp_path).execute(
+            _request(tmp_path, "printf REQUEST_SECRET"), _limits()
+        )
+
+    assert caught.value.backend == "docker"
+    assert caught.value.reason == "startup-failed"
+    assert "SECRET" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert len(calls) == 1
+
+
 # 功能：cleanup spawn 的任意失败统一转换为脱敏 cleanup-failed
 # 设计：主 run 超时后让 rm spawn 抛含 Secret 的 OSError，并验证原 run 仍被有界 kill/drain
 async def test_execute_sanitizes_cleanup_spawn_failure(
@@ -936,6 +1079,33 @@ async def test_execute_reports_daemon_api_permission_failure(
     assert caught.value.reason == "daemon-unreachable"
 
 
+# 功能：daemon-unreachable 标记即使完全位于输出保留上限之后且跨 chunks 仍被识别
+# 设计：只保留前 2 bytes，同时将稳定 marker 拆成三段，阻止检测退化为 retained 前缀扫描
+async def test_execute_detects_split_daemon_marker_after_output_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chunks = [
+        b"xx discarded prefix ",
+        b"Cannot con",
+        b"nect to the Docker ",
+        b"daemon at unix:///socket",
+    ]
+    process = _StreamingProcess(chunks, returncode=1)
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> _StreamingProcess:
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    with pytest.raises(SandboxUnavailableError) as caught:
+        await _backend(tmp_path).execute(
+            _request(tmp_path), _limits(output_limit_bytes=2)
+        )
+
+    assert caught.value.reason == "daemon-unreachable"
+    assert process.stdout.read_sizes == [65_536] * (len(chunks) + 1)
+
+
 # 功能：cleanup communicate 异常被脱敏且优先于原 run communication 异常
 # 设计：两条通信路径同时抛含 Secret 的错误，安全关键的 cleanup-failed 必须成为唯一对外错误
 async def test_cleanup_failure_has_priority_over_run_communication_failure(
@@ -986,6 +1156,67 @@ async def test_execute_communication_error_still_removes_container(
     name = calls[0][calls[0].index("--name") + 1]
     assert calls[1] == ("docker", "rm", "-f", name)
     assert cleanup_process.communicated is True
+
+
+# 功能：stdout collector 先失败而 Docker CLI 仍运行时，清理后用独立 wait task 完成收割
+# 设计：cleanup 才释放 wait，成功 reaping 后保留原 collector 错误且所有 wait task 已结束
+async def test_execute_collector_error_reaps_running_docker_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = "7766554433221100"
+    release_wait = asyncio.Event()
+    run_process = _FakeProcess(
+        error=RuntimeError("stream failed"), wait_release=release_wait
+    )
+    cleanup_process = _FakeProcess(on_communicate=release_wait.set)
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> _FakeProcess:
+        calls.append(argv)
+        return run_process if len(calls) == 1 else cleanup_process
+
+    monkeypatch.setattr("kama_claude.core.sandbox.docker.secrets.token_hex", lambda _: token)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    with pytest.raises(RuntimeError, match="stream failed"):
+        await _backend(tmp_path).execute(_request(tmp_path), _limits())
+
+    assert calls[1] == ("docker", "rm", "-f", f"kama-{token}")
+    assert run_process.wait_calls == 1
+    assert all(task.done() for task in run_process.wait_tasks)
+    assert cleanup_process.communicated is True
+
+
+# 功能：collector 错误后的 process.wait 卡住时，有限 deadline 必须 kill/reap 并仅暴露稳定错误
+# 设计：wait 仅由 kill 释放，验证原 Secret 异常不泄漏、无 cause 且 wait task 不残留
+async def test_execute_collector_error_bounds_and_sanitizes_run_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release_wait = asyncio.Event()
+    run_process = _FakeProcess(
+        error=RuntimeError("stream exposed WAIT_SECRET"), wait_release=release_wait
+    )
+    cleanup_process = _FakeProcess()
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> _FakeProcess:
+        calls.append(argv)
+        return run_process if len(calls) == 1 else cleanup_process
+
+    monkeypatch.setattr(
+        "kama_claude.core.sandbox.docker._RUN_REAP_TIMEOUT_S", 0.01
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    with pytest.raises(SandboxUnavailableError) as caught:
+        await _backend(tmp_path).execute(_request(tmp_path), _limits())
+
+    assert caught.value.reason == "cleanup-failed"
+    assert "WAIT_SECRET" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert run_process.killed is True
+    assert run_process.wait_calls == 1
+    assert all(task.done() for task in run_process.wait_tasks)
 
 
 # 功能：sandbox 包根稳定导出结构化不可用错误
