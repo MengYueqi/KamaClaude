@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tomllib
 from dataclasses import dataclass, field
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -51,7 +52,7 @@ class PermissionConfig:
 
 @dataclass
 class CompactionConfig:
-    auto_threshold: float = 0.0    # context_pct 触发自动压缩的阈值（0 表示禁用，推荐用手动 /compact）
+    auto_threshold: float = 0.0  # context_pct 触发自动压缩的阈值（0 表示禁用，推荐用手动 /compact）
     tool_result_limit: int = 8_000  # tool_result 截断触发字符数
     tool_result_keep: int = 4_000   # 截断后保留的前缀字符数
 
@@ -73,6 +74,23 @@ class McpConfig:
 
 
 @dataclass
+class SandboxConfig:
+    backend: str = "host"
+    workspace_root: str = "."
+    network: bool = False
+    docker_image: str = "kama-sandbox:py312"
+    timeout_s: int = 120
+    output_limit_bytes: int = 65_536
+    memory_mb: int = 1_024
+    cpu_count: float = 2.0
+    pids_limit: int = 128
+    tmpfs_mb: int = 256
+    env_allowlist: list[str] = field(
+        default_factory=lambda: ["PATH", "LANG", "LC_ALL", "TERM"]
+    )
+
+
+@dataclass
 class KamaConfig:
     host: str = _DEFAULT_HOST
     port: int = _DEFAULT_PORT
@@ -83,6 +101,7 @@ class KamaConfig:
     permission: PermissionConfig = field(default_factory=PermissionConfig)
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
+    sandbox: SandboxConfig = field(default_factory=SandboxConfig)
 
 
 # 构建并返回运行时配置：默认值 → 全局 TOML → 项目本地 TOML → .env → 系统环境变量（后者优先级最高）
@@ -117,7 +136,18 @@ def get_config() -> KamaConfig:
 
 # 将已解析的 TOML 根表写入 config；未知小节或类型错误时退出进程
 def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
-    unknown = set(data.keys()) - {"core", "logging", "agent", "llm", "trace", "permission", "compaction", "mcp"}
+    allowed_sections = {
+        "core",
+        "logging",
+        "agent",
+        "llm",
+        "trace",
+        "permission",
+        "compaction",
+        "mcp",
+        "sandbox",
+    }
+    unknown = set(data.keys()) - allowed_sections
     if unknown:
         raise SystemExit(f"Unknown top-level config keys: {', '.join(sorted(unknown))}")
 
@@ -224,7 +254,11 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
         comp = data["compaction"]
         if not isinstance(comp, dict):
             raise SystemExit("Config error: [compaction] must be a table")
-        unknown_comp: set[str] = set(comp.keys()) - {"auto_threshold", "tool_result_limit", "tool_result_keep"}
+        unknown_comp: set[str] = set(comp.keys()) - {
+            "auto_threshold",
+            "tool_result_limit",
+            "tool_result_keep",
+        }
         if unknown_comp:
             raise SystemExit(f"Unknown [compaction] keys: {', '.join(sorted(unknown_comp))}")
         if "auto_threshold" in comp:
@@ -235,12 +269,16 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
         if "tool_result_limit" in comp:
             val = comp["tool_result_limit"]
             if not isinstance(val, int) or val <= 0:
-                raise SystemExit("Config error: compaction.tool_result_limit must be a positive integer")
+                raise SystemExit(
+                    "Config error: compaction.tool_result_limit must be a positive integer"
+                )
             config.compaction.tool_result_limit = val
         if "tool_result_keep" in comp:
             val = comp["tool_result_keep"]
             if not isinstance(val, int) or val <= 0:
-                raise SystemExit("Config error: compaction.tool_result_keep must be a positive integer")
+                raise SystemExit(
+                    "Config error: compaction.tool_result_keep must be a positive integer"
+                )
             config.compaction.tool_result_keep = val
 
     if "mcp" in data:
@@ -261,7 +299,9 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
                 raise SystemExit(f"Config error: mcp.servers[{i}].name must be a non-empty string")
             transport = srv.get("transport", "stdio")
             if transport not in ("stdio", "tcp"):
-                raise SystemExit(f"Config error: mcp.servers[{i}].transport must be 'stdio' or 'tcp'")
+                raise SystemExit(
+                    f"Config error: mcp.servers[{i}].transport must be 'stdio' or 'tcp'"
+                )
             s = McpServerConfig(name=name, transport=transport)
             if "command" in srv:
                 val = srv["command"]
@@ -289,6 +329,92 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
                     raise SystemExit(f"Config error: mcp.servers[{i}].port must be an integer")
                 s.port = val
             config.mcp.servers.append(s)
+
+    if "sandbox" in data:
+        sandbox = data["sandbox"]
+        if not isinstance(sandbox, dict):
+            raise SystemExit("Config error: [sandbox] must be a table")
+        allowed_sandbox = {
+            "backend",
+            "workspace_root",
+            "network",
+            "docker_image",
+            "timeout_s",
+            "output_limit_bytes",
+            "memory_mb",
+            "cpu_count",
+            "pids_limit",
+            "tmpfs_mb",
+            "env_allowlist",
+        }
+        unknown_sandbox = set(sandbox.keys()) - allowed_sandbox
+        if unknown_sandbox:
+            raise SystemExit(
+                f"Unknown [sandbox] keys: {', '.join(sorted(unknown_sandbox))}"
+            )
+        for key in ("backend", "workspace_root", "docker_image"):
+            if key in sandbox:
+                setattr(config.sandbox, key, sandbox[key])
+        for key in (
+            "network",
+            "timeout_s",
+            "output_limit_bytes",
+            "memory_mb",
+            "cpu_count",
+            "pids_limit",
+            "tmpfs_mb",
+            "env_allowlist",
+        ):
+            if key in sandbox:
+                setattr(config.sandbox, key, sandbox[key])
+        _validate_sandbox_config(config.sandbox)
+
+
+# 验证沙箱配置的类型和安全边界，并规范化 CPU 数量
+def _validate_sandbox_config(sandbox: SandboxConfig) -> None:
+    if sandbox.backend not in {"host", "docker"}:
+        raise SystemExit("Config error: sandbox.backend must be 'host' or 'docker'")
+    if not isinstance(sandbox.workspace_root, str):
+        raise SystemExit("Config error: sandbox.workspace_root must be a string")
+    if not isinstance(sandbox.network, bool):
+        raise SystemExit("Config error: sandbox.network must be a boolean")
+    if not isinstance(sandbox.docker_image, str) or not sandbox.docker_image:
+        raise SystemExit("Config error: sandbox.docker_image must be a non-empty string")
+    for key in (
+        "timeout_s",
+        "output_limit_bytes",
+        "memory_mb",
+        "pids_limit",
+        "tmpfs_mb",
+    ):
+        value = getattr(sandbox, key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise SystemExit(f"Config error: sandbox.{key} must be a positive integer")
+    if (
+        isinstance(sandbox.cpu_count, bool)
+        or not isinstance(sandbox.cpu_count, (int, float))
+        or not isfinite(float(sandbox.cpu_count))
+        or sandbox.cpu_count <= 0
+    ):
+        raise SystemExit("Config error: sandbox.cpu_count must be a positive number")
+    sandbox.cpu_count = float(sandbox.cpu_count)
+    if not isinstance(sandbox.env_allowlist, list) or not all(
+        isinstance(name, str) for name in sandbox.env_allowlist
+    ):
+        raise SystemExit("Config error: sandbox.env_allowlist must be an array of strings")
+
+
+# 将明确的环境布尔拼写转换为布尔值，拒绝歧义输入
+def _parse_sandbox_network(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise SystemExit(
+        "Config error: KAMA_SANDBOX_NETWORK must be one of "
+        "1, 0, true, false, yes, no, on, or off"
+    )
 
 
 # 用 KAMA_* 环境变量覆盖 config 中对应字段（若变量已设置）
@@ -367,7 +493,8 @@ def _apply_env(config: KamaConfig) -> None:
             compact_threshold_val = float(compact_threshold)
             if not (0.0 <= compact_threshold_val <= 1.0):
                 raise SystemExit(
-                    f"Config error: KAMA_COMPACT_THRESHOLD must be between 0 and 1, got: {compact_threshold!r}"
+                    "Config error: KAMA_COMPACT_THRESHOLD must be between 0 and 1, "
+                    f"got: {compact_threshold!r}"
                 )
             config.compaction.auto_threshold = compact_threshold_val
         except ValueError:
@@ -381,12 +508,14 @@ def _apply_env(config: KamaConfig) -> None:
             compact_tool_limit_val = int(compact_tool_limit)
             if compact_tool_limit_val <= 0:
                 raise SystemExit(
-                    f"Config error: KAMA_COMPACT_TOOL_LIMIT must be a positive integer, got: {compact_tool_limit!r}"
+                    "Config error: KAMA_COMPACT_TOOL_LIMIT must be a positive integer, "
+                    f"got: {compact_tool_limit!r}"
                 )
             config.compaction.tool_result_limit = compact_tool_limit_val
         except ValueError:
             raise SystemExit(
-                f"Config error: KAMA_COMPACT_TOOL_LIMIT must be an integer, got: {compact_tool_limit!r}"
+                "Config error: KAMA_COMPACT_TOOL_LIMIT must be an integer, "
+                f"got: {compact_tool_limit!r}"
             )
 
     compact_tool_keep = os.environ.get("KAMA_COMPACT_TOOL_KEEP")
@@ -395,10 +524,30 @@ def _apply_env(config: KamaConfig) -> None:
             compact_tool_keep_val = int(compact_tool_keep)
             if compact_tool_keep_val <= 0:
                 raise SystemExit(
-                    f"Config error: KAMA_COMPACT_TOOL_KEEP must be a positive integer, got: {compact_tool_keep!r}"
+                    "Config error: KAMA_COMPACT_TOOL_KEEP must be a positive integer, "
+                    f"got: {compact_tool_keep!r}"
                 )
             config.compaction.tool_result_keep = compact_tool_keep_val
         except ValueError:
             raise SystemExit(
-                f"Config error: KAMA_COMPACT_TOOL_KEEP must be an integer, got: {compact_tool_keep!r}"
+                "Config error: KAMA_COMPACT_TOOL_KEEP must be an integer, "
+                f"got: {compact_tool_keep!r}"
             )
+
+    sandbox_backend = os.environ.get("KAMA_SANDBOX_BACKEND")
+    if sandbox_backend is not None:
+        config.sandbox.backend = sandbox_backend
+
+    sandbox_workspace_root = os.environ.get("KAMA_SANDBOX_WORKSPACE_ROOT")
+    if sandbox_workspace_root is not None:
+        config.sandbox.workspace_root = sandbox_workspace_root
+
+    sandbox_network = os.environ.get("KAMA_SANDBOX_NETWORK")
+    if sandbox_network is not None:
+        config.sandbox.network = _parse_sandbox_network(sandbox_network)
+
+    sandbox_docker_image = os.environ.get("KAMA_SANDBOX_DOCKER_IMAGE")
+    if sandbox_docker_image is not None:
+        config.sandbox.docker_image = sandbox_docker_image
+
+    _validate_sandbox_config(config.sandbox)
