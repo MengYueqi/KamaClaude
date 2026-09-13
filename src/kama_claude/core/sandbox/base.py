@@ -20,6 +20,12 @@ class SandboxBackend(ABC):
     def strongly_isolated(self) -> bool:
         """Return whether the backend enforces strong isolation."""
 
+    # 返回后端是否允许出站网络；兼容宿主和既有第三方后端时默认可用
+    @property
+    def network_enabled(self) -> bool:
+        """Return whether commands can use the network."""
+        return True
+
     # 在后端中执行请求并返回标准化结果
     @abstractmethod
     async def execute(self, request: ExecRequest, limits: SandboxLimits) -> ExecResult:

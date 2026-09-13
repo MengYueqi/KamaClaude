@@ -64,6 +64,11 @@ class DockerBackend(SandboxBackend):
     def strongly_isolated(self) -> bool:
         return True
 
+    # 返回构造时固定的 Docker 网络策略，供公开执行元数据使用
+    @property
+    def network_enabled(self) -> bool:
+        return self._network
+
     # 构造不经过宿主 Shell 的完整 Docker argv
     def _build_argv(
         self, request: ExecRequest, limits: SandboxLimits, container_name: str

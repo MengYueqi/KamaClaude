@@ -308,6 +308,13 @@ def test_build_argv_maps_enabled_network_to_bridge(tmp_path: Path) -> None:
     assert "host" not in argv
 
 
+# 功能：DockerBackend 公开的网络能力与固定构造配置一致
+# 设计：分别构造禁用和启用网络的后端，防止事件元数据通过名称猜测而失真
+def test_network_enabled_reflects_static_configuration(tmp_path: Path) -> None:
+    assert _backend(tmp_path, network=False).network_enabled is False
+    assert _backend(tmp_path, network=True).network_enabled is True
+
+
 # 功能：根工作目录精确映射为容器内 /workspace
 # 设计：覆盖 WorkspaceFS.relative 的点路径分支，避免生成带尾部点段的容器目录
 def test_build_argv_maps_workspace_root_to_container_root(tmp_path: Path) -> None:

@@ -69,6 +69,7 @@ class PermissionManager:
         params: dict[str, Any],
         session_id: str,
         event_emitter: Callable[[dict[str, Any]], Awaitable[None]],
+        execution: dict[str, Any] | None = None,
     ) -> tuple[bool, str]:
         command = str(params.get("command", "")) if tool_name == "bash" else ""
         policy = self._policies.get(tool_name)
@@ -128,6 +129,7 @@ class PermissionManager:
                 "params": params,
                 "param_preview": param_preview(tool_name, params),
                 "session_id": session_id,
+                "execution": execution or {},
                 "ts": _now(),
             }
         )

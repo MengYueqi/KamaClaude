@@ -73,16 +73,6 @@ async def invoke_tool(
 ) -> ToolResult:
     t0 = time.monotonic()
 
-    await bus.publish(
-        ToolCallStartedEvent(
-            run_id=run_id,
-            tool_use_id=tool_call.id,
-            tool_name=tool_call.name,
-            params=dict(tool_call.input),
-            ts=_now(),
-        )
-    )
-
     def elapsed() -> int:
         return int((time.monotonic() - t0) * 1000)
 
@@ -102,6 +92,19 @@ async def invoke_tool(
                 "schema_error", str(exc), elapsed(),
             )
 
+    params = dict(tool_call.input)
+    execution = tool.execution_metadata(params)
+    await bus.publish(
+        ToolCallStartedEvent(
+            run_id=run_id,
+            tool_use_id=tool_call.id,
+            tool_name=tool_call.name,
+            params=params,
+            execution=execution,
+            ts=_now(),
+        )
+    )
+
     if permission_manager is not None:
         async def _emit_permission(raw: dict[str, Any]) -> None:
             await bus.publish(PermissionRequestedEvent(**raw, run_id=run_id))
@@ -112,6 +115,7 @@ async def invoke_tool(
             params=dict(tool_call.input),
             session_id=session_id,
             event_emitter=_emit_permission,
+            execution=execution,
         )
         if allowed:
             if decision not in ("auto_allow",):

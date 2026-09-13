@@ -49,6 +49,21 @@ def _param_summary(tool_name: str, params: dict[str, Any], max_len: int = 72) ->
     return _preview(", ".join(parts), max_len)
 
 
+# 将公开执行元数据格式化为稳定的单行沙箱摘要，并忽略未知字段
+def _execution_summary(execution: dict[str, Any]) -> str:
+    labels = (
+        ("sandbox", "backend"),
+        ("cwd", "cwd"),
+        ("workspace", "workspace_access"),
+        ("network", "network"),
+    )
+    return " ".join(
+        f"{label}={execution[key]}"
+        for label, key in labels
+        if key in execution
+    )
+
+
 class LLMStreamBlock(Static):
     """在同一个 Static widget 中累积 LLM 流式 token。"""
 
@@ -87,11 +102,17 @@ class ToolCallBlock(Widget):
     """
 
     # 初始化工具调用信息
-    def __init__(self, tool_name: str, params: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        tool_name: str,
+        params: dict[str, Any],
+        execution: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__()
         self._tool_name = tool_name
         self._params = params
         self._params_full = _params_str(params)
+        self._execution = execution or {}
         self._output = ""
         self._elapsed_ms = 0
         self._is_error = False
@@ -110,6 +131,9 @@ class ToolCallBlock(Widget):
         line = f"  [dim]tool[/dim] [bold]{self._tool_name}[/bold]"
         if params_pre:
             line += f"  [dim]{params_pre}[/dim]"
+        execution_pre = _execution_summary(self._execution)
+        if execution_pre:
+            line += f"\n  [dim]{execution_pre}[/dim]"
         if self._finished:
             color = "red" if self._is_error else "green"
             status = "failed" if self._is_error else "done"
@@ -268,16 +292,28 @@ class PermissionBlock(Static):
             super().__init__()
 
     # 初始化审批块，记录工具 ID、名称和参数预览
-    def __init__(self, tool_use_id: str, tool_name: str, param_preview: str) -> None:
+    def __init__(
+        self,
+        tool_use_id: str,
+        tool_name: str,
+        param_preview: str,
+        execution: dict[str, Any] | None = None,
+    ) -> None:
         self._tool_use_id = tool_use_id
         self._tool_name = tool_name
         self._param_preview = param_preview
+        self._execution = execution or {}
         self._resolved = False
         super().__init__(self._pending_text(), classes="log-line")
 
     def _pending_text(self) -> str:
         preview = f"  [dim]{self._param_preview}[/dim]" if self._param_preview else ""
-        return f"[bold red]? permission[/bold red]  [bold]{self._tool_name}[/bold]{preview}"
+        metadata = _execution_summary(self._execution)
+        detail = f"\n  [dim]{metadata}[/dim]" if metadata else ""
+        return (
+            f"[bold red]? permission[/bold red]  [bold]{self._tool_name}[/bold]"
+            f"{preview}{detail}"
+        )
 
     # 将块收缩为单行摘要并发布 Resolved 消息
     def _resolve(self, decision: str) -> None:
@@ -288,8 +324,11 @@ class PermissionBlock(Static):
         icon = "[bold green]✓[/bold green]" if allowed else "[bold red]✗[/bold red]"
         label = self._LABEL_MAP.get(decision, decision)
         preview = f"  [dim]{self._param_preview}[/dim]" if self._param_preview else ""
+        metadata = _execution_summary(self._execution)
+        detail = f"  [dim]{metadata}[/dim]" if metadata else ""
         self.update(
-            f"{icon} permission  [bold]{self._tool_name}[/bold]{preview}  [dim]{label}[/dim]"
+            f"{icon} permission  [bold]{self._tool_name}[/bold]{preview}  "
+            f"[dim]{label}[/dim]{detail}"
         )
         self.post_message(self.Resolved(self, decision))
 
@@ -937,8 +976,13 @@ class KamaTuiApp(App[None]):
             tool_use_id = str(event.get("tool_use_id", ""))
             tool_name = str(event.get("tool_name", ""))
             params = event.get("params") or {}
+            execution = event.get("execution") or {}
             run_id = event.get("run_id", "")
-            tc_block = ToolCallBlock(tool_name, params)
+            tc_block = ToolCallBlock(
+                tool_name,
+                params,
+                execution if isinstance(execution, dict) else {},
+            )
             if run_id in self._subagent_run_ids:
                 tc_block.styles.padding = (0, 2, 0, 6)
             self._pending_tool_blocks[tool_use_id] = tc_block
@@ -1006,6 +1050,7 @@ class KamaTuiApp(App[None]):
             tool_use_id = str(event.get("tool_use_id", ""))
             tool_name = str(event.get("tool_name", ""))
             param_preview = str(event.get("param_preview", ""))
+            execution = event.get("execution") or {}
             try:
                 _focused_repr = repr(self.focused)
             except Exception:
@@ -1014,7 +1059,12 @@ class KamaTuiApp(App[None]):
                 "permission.requested tool=%s id=%s  app.focused=%s",
                 tool_name, tool_use_id, _focused_repr,
             )
-            perm_block = PermissionBlock(tool_use_id, tool_name, param_preview)
+            perm_block = PermissionBlock(
+                tool_use_id,
+                tool_name,
+                param_preview,
+                execution if isinstance(execution, dict) else {},
+            )
             self._pending_permission_blocks[tool_use_id] = perm_block
             prompt = self._prompt()
             if prompt is not None:

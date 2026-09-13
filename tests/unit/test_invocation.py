@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -26,6 +27,14 @@ class _EchoTool(BaseTool):
         "required": ["msg"],
     }
     params_model = _EchoParams
+
+    def __init__(self) -> None:
+        self.metadata_calls: list[dict[str, object]] = []
+        self.metadata = {"backend": "test", "cwd": "."}
+
+    def execution_metadata(self, params: dict[str, object]) -> dict[str, object]:
+        self.metadata_calls.append(params)
+        return self.metadata
 
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         return ToolResult(content=str(params["msg"]))
@@ -80,7 +89,8 @@ async def _run(
 # 设计：同时检查返回值和事件序列，因为 invoke_tool 的双重职责是"返回结果 + 发布事件"，缺一不可
 async def test_success_returns_content_and_finished_event() -> None:
     registry = ToolRegistry()
-    registry.register(_EchoTool())
+    tool = _EchoTool()
+    registry.register(tool)
     result, events = await _run(registry, _call("echo", {"msg": "hi"}))
     assert not result.is_error
     assert result.content == "hi"
@@ -88,6 +98,44 @@ async def test_success_returns_content_and_finished_event() -> None:
     assert types[0] == "tool.call_started"
     assert "tool.call_finished" in types
     assert "tool.call_failed" not in types
+    assert events[0].execution == {"backend": "test", "cwd": "."}  # type: ignore[attr-defined]
+    assert tool.metadata_calls == [{"msg": "hi"}]
+
+
+# 功能：invoke_tool 将工具生成的同一份执行元数据传给 started 事件和权限管理器
+# 设计：fake manager 捕获 execution 对象，验证无重算、无字段删改的单向传递
+async def test_execution_metadata_is_forwarded_unchanged_to_permission_manager() -> None:
+    class _PermissionManager:
+        def __init__(self) -> None:
+            self.execution: dict[str, object] | None = None
+
+        async def check_and_wait(self, **kwargs: Any) -> tuple[bool, str]:
+            self.execution = kwargs["execution"]
+            return True, "auto_allow"
+
+    registry = ToolRegistry()
+    tool = _EchoTool()
+    registry.register(tool)
+    manager = _PermissionManager()
+    bus = EventBus()
+    events: list[BaseModel] = []
+
+    async def _collect(event: BaseModel) -> None:
+        events.append(event)
+
+    bus.subscribe(_collect)
+
+    result = await invoke_tool(
+        registry,
+        _call("echo", {"msg": "hi"}),
+        bus,
+        run_id="r1",
+        permission_manager=manager,  # type: ignore[arg-type]
+    )
+
+    assert not result.is_error
+    assert manager.execution is tool.metadata
+    assert events[0].execution == tool.metadata  # type: ignore[attr-defined]
 
 
 # 功能：验证调用不存在的工具时返回 runtime_error 并发布 failed 事件而非 finished
@@ -98,7 +146,7 @@ async def test_unknown_tool_returns_runtime_error() -> None:
     assert result.error_type == "runtime_error"
     assert "unknown tool" in result.content
     types = [e.type for e in events]  # type: ignore[attr-defined]
-    assert "tool.call_started" in types
+    assert "tool.call_started" not in types
     assert "tool.call_failed" in types
     assert "tool.call_finished" not in types
 
@@ -107,12 +155,15 @@ async def test_unknown_tool_returns_runtime_error() -> None:
 # 设计：注册需要 msg 参数的 EchoTool 但传空 input，确认错误分类准确，schema 错误与运行时错误对 S4 重试策略有不同影响
 async def test_missing_required_param_gives_schema_error() -> None:
     registry = ToolRegistry()
-    registry.register(_EchoTool())
+    tool = _EchoTool()
+    registry.register(tool)
     result, events = await _run(registry, _call("echo", {}))  # "msg" is required
     assert result.is_error
     assert result.error_type == "schema_error"
     types = [e.type for e in events]  # type: ignore[attr-defined]
     assert "tool.call_failed" in types
+    assert "tool.call_started" not in types
+    assert tool.metadata_calls == []
 
 
 # 功能：验证工具执行超时时返回 timeout 类型错误而非 runtime_error
@@ -138,8 +189,9 @@ async def test_runtime_exception_gives_runtime_error() -> None:
     assert "boom" in result.content
 
 
-# 功能：验证 tool.call_started 始终是第一个被发布的事件，即使工具调用最终失败
-# 设计：用不存在的工具触发失败路径，确认即使失败也先发布 started，保证事件流的时序可观测性
-async def test_started_event_always_first() -> None:
+# 功能：未知工具在解析失败时只发布 failed，不伪造已经开始执行的事件
+# 设计：用不存在的工具覆盖先 resolve 后 started 的新时序契约
+async def test_unknown_tool_does_not_emit_started_event() -> None:
     result, events = await _run(ToolRegistry(), _call("nonexistent"))
-    assert events[0].type == "tool.call_started"  # type: ignore[attr-defined]
+    assert result.is_error
+    assert [event.type for event in events] == ["tool.call_failed"]  # type: ignore[attr-defined]

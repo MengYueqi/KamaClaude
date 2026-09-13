@@ -83,6 +83,19 @@ def test_sandbox_backend_is_abstract() -> None:
     assert IncompleteBackend.__abstractmethods__ == {"name", "strongly_isolated", "execute"}
 
 
+# 功能：兼容后端未声明网络策略时默认反映宿主网络可用
+# 设计：默认具体属性避免破坏现有第三方 backend，同时提供元数据所需的公开能力查询
+def test_sandbox_backend_network_enabled_defaults_true() -> None:
+    class FakeBackend(SandboxBackend):
+        name = "fake"
+        strongly_isolated = False
+
+        async def execute(self, request: ExecRequest, limits: SandboxLimits) -> ExecResult:
+            return ExecResult(0, "ok")
+
+    assert FakeBackend().network_enabled is True
+
+
 # 功能：验证 close 默认是可安全调用的异步 no-op
 # 设计：无资源后端不需要覆写 close，Runner 统一清理流程仍可 await
 @pytest.mark.asyncio

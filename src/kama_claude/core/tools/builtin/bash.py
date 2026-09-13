@@ -77,6 +77,17 @@ class BashTool(BaseTool):
             return f"{output}\n[truncated]"
         return output
 
+    # 仅公开静态沙箱能力与相对工作目录，不暴露命令和执行环境
+    def execution_metadata(self, params: dict[str, object]) -> dict[str, object]:
+        parsed = BashParams.model_validate(params)
+        return {
+            "backend": self._backend.name,
+            "strongly_isolated": self._backend.strongly_isolated,
+            "cwd": parsed.cwd,
+            "workspace_access": "rw",
+            "network": "on" if self._backend.network_enabled else "off",
+        }
+
     # 校验工作目录并将命令委托给注入的沙箱后端
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = BashParams.model_validate(params)

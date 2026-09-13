@@ -22,6 +22,10 @@ class BaseTool(ABC):
     input_schema: dict[str, object]
     params_model: ClassVar[type[BaseModel] | None] = None
 
+    # 返回当前调用的可公开执行元数据，供事件和审批界面展示
+    def execution_metadata(self, params: dict[str, object]) -> dict[str, object]:
+        return {}
+
     # 执行工具调用，返回结果或错误
     @abstractmethod
     async def invoke(self, params: dict[str, object]) -> ToolResult: ...

@@ -24,6 +24,7 @@ from kama_claude.core.tools.builtin.write_file import WriteFileTool
 class _RecordingBackend(SandboxBackend):
     name = "fake"
     strongly_isolated = True
+    network_enabled = False
 
     def __init__(self, result: ExecResult | BaseException) -> None:
         self.result = result
@@ -56,6 +57,28 @@ def _bash_tool(
         env_allowlist,
         tmp_path / ".runtime",
     )
+
+
+# 功能：Bash 只公开五项静态执行事实，不泄露命令或进程环境
+# 设计：调用同步 metadata hook 并精确断言键集合和值，建立事件边界的安全契约
+def test_bash_execution_metadata_exposes_only_public_sandbox_facts(
+    tmp_path: Path,
+) -> None:
+    tool = _bash_tool(tmp_path, _RecordingBackend(ExecResult(0, "ok")))
+
+    metadata = tool.execution_metadata(
+        {"command": "echo $API_KEY", "cwd": "project", "env": {"API_KEY": "secret"}}
+    )
+
+    assert metadata == {
+        "backend": "fake",
+        "strongly_isolated": True,
+        "cwd": "project",
+        "workspace_access": "rw",
+        "network": "off",
+    }
+    assert "command" not in metadata
+    assert "env" not in metadata
 
 
 # 功能：成功命令仅通过注入后端执行，并传递规范 cwd、白名单环境与完整资源限制

@@ -83,6 +83,38 @@ async def test_check_and_wait_ask_emits_event_and_waits() -> None:
     assert emitted[0]["type"] == "permission.requested"
     assert emitted[0]["tool_use_id"] == "t2"
     assert emitted[0]["tool_name"] == "bash"
+    assert emitted[0]["execution"] == {}
+
+
+# 功能：ASK 权限事件原样携带调用方提供的公开执行元数据
+# 设计：使用嵌套标记并断言值相等，覆盖 invoke_tool 到审批 UI 的无损传递边界
+async def test_check_and_wait_forwards_execution_metadata_unchanged() -> None:
+    mgr = _make_manager()
+    emitted, emitter = await _collect_emitted()
+    execution = {
+        "backend": "docker",
+        "strongly_isolated": True,
+        "cwd": ".",
+        "workspace_access": "rw",
+        "network": "off",
+    }
+
+    async def _auto_respond() -> None:
+        await asyncio.sleep(0)
+        mgr.respond("t-meta", "allow_once")
+
+    task = asyncio.create_task(_auto_respond())
+    await mgr.check_and_wait(
+        tool_use_id="t-meta",
+        tool_name="bash",
+        params={"command": "echo hi"},
+        session_id="s1",
+        event_emitter=emitter,
+        execution=execution,
+    )
+    await task
+
+    assert emitted[0]["execution"] == execution
 
 
 # 功能：验证 respond("deny_once") 使 check_and_wait 返回 (False, "deny_once")
