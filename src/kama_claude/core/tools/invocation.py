@@ -93,7 +93,19 @@ async def invoke_tool(
             )
 
     params = dict(tool_call.input)
-    execution = tool.execution_metadata(params)
+    try:
+        execution = tool.execution_metadata(params)
+        if not isinstance(execution, dict):
+            raise TypeError("execution metadata must be a dictionary")
+    except Exception:
+        return await _fail(
+            bus,
+            run_id,
+            tool_call,
+            "runtime_error",
+            "tool execution metadata failed",
+            elapsed(),
+        )
     await bus.publish(
         ToolCallStartedEvent(
             run_id=run_id,

@@ -138,6 +138,43 @@ async def test_execution_metadata_is_forwarded_unchanged_to_permission_manager()
     assert events[0].execution == tool.metadata  # type: ignore[attr-defined]
 
 
+# 功能：metadata hook 抛异常时 invoke_tool 仍返回 runtime_error，且不发布 started
+# 设计：异常文本包含 Secret，断言稳定失败结果不会让扩展 hook 破坏不抛异常契约
+async def test_execution_metadata_exception_returns_runtime_error_before_started() -> None:
+    class _RaisingMetadataTool(_EchoTool):
+        def execution_metadata(self, params: dict[str, object]) -> dict[str, object]:
+            raise RuntimeError("API_KEY=must-not-leak")
+
+    registry = ToolRegistry()
+    registry.register(_RaisingMetadataTool())
+
+    result, events = await _run(registry, _call("echo", {"msg": "hi"}))
+
+    assert result.is_error
+    assert result.error_type == "runtime_error"
+    assert result.content == "tool execution metadata failed"
+    assert "must-not-leak" not in result.content
+    assert [event.type for event in events] == ["tool.call_failed"]  # type: ignore[attr-defined]
+
+
+# 功能：metadata hook 返回非字典时转换为 runtime_error，而非泄漏 Pydantic ValidationError
+# 设计：故意违反插件 hook 返回契约，覆盖运行时类型边界和 started-before-validation 回归
+async def test_execution_metadata_non_dict_returns_runtime_error_before_started() -> None:
+    class _InvalidMetadataTool(_EchoTool):
+        def execution_metadata(self, params: dict[str, object]) -> dict[str, object]:
+            return "not-a-dict"  # type: ignore[return-value]
+
+    registry = ToolRegistry()
+    registry.register(_InvalidMetadataTool())
+
+    result, events = await _run(registry, _call("echo", {"msg": "hi"}))
+
+    assert result.is_error
+    assert result.error_type == "runtime_error"
+    assert result.content == "tool execution metadata failed"
+    assert [event.type for event in events] == ["tool.call_failed"]  # type: ignore[attr-defined]
+
+
 # 功能：验证调用不存在的工具时返回 runtime_error 并发布 failed 事件而非 finished
 # 设计：传入空 registry，确认 error_type 和事件类型同时正确，排除"未知工具却发布了 finished"的情况
 async def test_unknown_tool_returns_runtime_error() -> None:

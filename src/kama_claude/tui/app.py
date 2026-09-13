@@ -6,9 +6,8 @@ import logging
 import time
 from typing import Any
 
-log = logging.getLogger(__name__)
-
 from rich.markdown import Markdown
+from rich.markup import escape
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -21,6 +20,10 @@ from textual.widgets import Label, Static, TextArea
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.skills.loader import SkillLoader
 from kama_claude.core.transport.socket_client import IpcError, SocketClient
+
+log = logging.getLogger(__name__)
+
+_EXECUTION_VALUE_MAX_LEN = 48
 
 
 def _preview(s: str, n: int) -> str:
@@ -58,10 +61,18 @@ def _execution_summary(execution: dict[str, Any]) -> str:
         ("network", "network"),
     )
     return " ".join(
-        f"{label}={execution[key]}"
+        f"{label}={_safe_execution_value(execution[key])}"
         for label, key in labels
         if key in execution
     )
+
+
+# 将单个公开元数据值压成有界单行文本，并转义 Rich 标记控制字符
+def _safe_execution_value(value: Any) -> str:
+    normalized = " ".join(str(value).split())
+    if len(normalized) > _EXECUTION_VALUE_MAX_LEN:
+        normalized = normalized[: _EXECUTION_VALUE_MAX_LEN - 1] + "…"
+    return escape(normalized)
 
 
 class LLMStreamBlock(Static):
