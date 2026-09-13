@@ -102,7 +102,7 @@ class DockerBackend(SandboxBackend):
             "--tmpfs",
             f"/tmp:size={limits.tmpfs_mb}m",
             "--mount",
-            f"type=bind,src={self._workspace.root},dst=/workspace,rw",
+            f"type=bind,src={self._workspace.root},dst=/workspace",
             "--workdir",
             container_cwd,
             "--user",

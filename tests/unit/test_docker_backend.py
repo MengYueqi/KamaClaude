@@ -216,7 +216,7 @@ def _request(tmp_path: Path, command: str = "printf ok") -> ExecRequest:
 
 
 # 功能：构造完整且顺序稳定的 Docker 强隔离 argv
-# 设计：逐项手写期望值，任一网络、权限、资源、挂载、工作目录或用户限制丢失都会失败
+# 设计：逐项手写期望值，任一网络、权限、资源、有效挂载语法、工作目录或用户限制丢失都会失败
 def test_build_argv_applies_every_strong_isolation_constraint(tmp_path: Path) -> None:
     backend = _backend(tmp_path)
     request = _request(tmp_path)
@@ -246,7 +246,7 @@ def test_build_argv_applies_every_strong_isolation_constraint(tmp_path: Path) ->
         "--tmpfs",
         "/tmp:size=256m",
         "--mount",
-        f"type=bind,src={tmp_path.resolve()},dst=/workspace,rw",
+        f"type=bind,src={tmp_path.resolve()},dst=/workspace",
         "--workdir",
         "/workspace/nested",
         "--user",
@@ -341,7 +341,7 @@ def test_build_argv_passes_only_request_environment_with_safe_runtime_paths(
     env_values = [argv[index + 1] for index, value in enumerate(argv) if value == "--env"]
     mount_values = [argv[index + 1] for index, value in enumerate(argv) if value == "--mount"]
     assert env_values == ["HOME=/tmp", "TMPDIR=/tmp", "TOKEN=visible"]
-    assert mount_values == [f"type=bind,src={tmp_path.resolve()},dst=/workspace,rw"]
+    assert mount_values == [f"type=bind,src={tmp_path.resolve()},dst=/workspace"]
     assert "--env-file" not in argv
     assert all("CORE_ONLY_SECRET" not in value for value in argv)
     assert all(str(runtime_dir) not in value for value in argv)
