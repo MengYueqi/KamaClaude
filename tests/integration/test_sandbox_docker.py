@@ -146,20 +146,23 @@ async def test_host_only_file_path_is_not_readable(
     assert "not-mounted" not in result.output
 
 
-# 功能：验证禁网容器只暴露回环网卡且无法发起外部请求。
-# 设计：先读取真实 /sys/class/net 断言仅有 lo，再保留真实 HTTPS 请求失败断言。
+# 功能：验证禁网容器没有 IPv4 路由数据行且无法发起外部请求。
+# 设计：先读取真实 /proc/net/route 断言只有表头，再保留真实 HTTPS 请求失败断言。
 @pytest.mark.integration
 @pytest.mark.docker_sandbox
 async def test_network_request_fails_when_network_is_disabled(
     backend: DockerBackend, workspace: WorkspaceFS
 ) -> None:
-    interfaces_command = "python -c " + shlex.quote(
-        "from pathlib import Path; print('\\n'.join(sorted(path.name for path in Path('/sys/class/net').iterdir())))"
+    routes_command = "python -c " + shlex.quote(
+        "from pathlib import Path; print(Path('/proc/net/route').read_text(), end='')"
     )
-    interfaces = await backend.execute(_request(workspace, interfaces_command), _limits())
+    routes = await backend.execute(_request(workspace, routes_command), _limits())
 
-    assert interfaces.returncode == 0
-    assert set(interfaces.output.splitlines()) == {"lo"}
+    assert routes.returncode == 0
+    route_lines = routes.output.splitlines()
+    assert route_lines
+    assert route_lines[0].split()[:2] == ["Iface", "Destination"]
+    assert route_lines[1:] == []
 
     request_command = "python -c " + shlex.quote(
         "import urllib.request; urllib.request.urlopen('https://example.com', timeout=3).read()"
