@@ -146,30 +146,48 @@ async def test_network_request_fails_when_network_is_disabled(
     assert result.returncode != 0
 
 
-# Break caught: removing or increasing --pids-limit allows a child process beyond the configured cap.
+# Break caught: removing or increasing --pids-limit allows every requested live child to start.
 @pytest.mark.integration
 @pytest.mark.docker_sandbox
 async def test_fork_workload_cannot_exceed_pids_limit(
     backend: DockerBackend, workspace: WorkspaceFS
 ) -> None:
+    requested_children = 64
     command = "python -c " + shlex.quote(
-        "import os, sys\n"
+        "import os, signal, sys, time\n"
+        f"requested = {requested_children}\n"
+        "children = []\n"
         "try:\n"
-        "    child = os.fork()\n"
+        "    for _ in range(requested):\n"
+        "        child = os.fork()\n"
+        "        if child == 0:\n"
+        "            time.sleep(30)\n"
+        "            os._exit(0)\n"
+        "        children.append(child)\n"
         "except OSError:\n"
-        "    print('pids-limit-enforced')\n"
+        "    print(f'pids-limit-enforced:{len(children)}')\n"
         "else:\n"
-        "    if child == 0:\n"
-        "        os._exit(0)\n"
-        "    os.waitpid(child, 0)\n"
         "    print('pids-limit-not-enforced')\n"
         "    sys.exit(1)\n"
+        "finally:\n"
+        "    for child in children:\n"
+        "        try:\n"
+        "            os.kill(child, signal.SIGTERM)\n"
+        "        except ProcessLookupError:\n"
+        "            pass\n"
+        "    for child in children:\n"
+        "        try:\n"
+        "            os.waitpid(child, 0)\n"
+        "        except ChildProcessError:\n"
+        "            pass\n"
     )
 
-    result = await backend.execute(_request(workspace, command), _limits(pids_limit=1))
+    result = await backend.execute(_request(workspace, command), _limits(pids_limit=8))
 
     assert result.returncode == 0
-    assert result.output == "pids-limit-enforced\n"
+    marker, created = result.output.strip().split(":", maxsplit=1)
+    assert marker == "pids-limit-enforced"
+    assert 0 <= int(created) < requested_children
 
 
 # Break caught: timeout cleanup leaves the backend-created container alive after the request returns.
