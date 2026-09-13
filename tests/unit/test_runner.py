@@ -9,9 +9,17 @@ from kama_claude.core.config import KamaConfig
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
 from kama_claude.core.runner import AgentRunner
-from kama_claude.core.sandbox import WorkspaceFS
+from kama_claude.core.sandbox import (
+    ExecRequest,
+    ExecResult,
+    SandboxBackend,
+    SandboxLimits,
+    WorkspaceFS,
+)
+from kama_claude.core.sandbox.host import HostBackend
+from kama_claude.core.subagent.tool import SpawnAgentTool
 from kama_claude.core.task.manager import TaskManager
-from kama_claude.core.tools.builtin import ListDirTool, ReadFileTool, WriteFileTool
+from kama_claude.core.tools.builtin import BashTool, ListDirTool, ReadFileTool, WriteFileTool
 
 # --- mock provider -----------------------------------------------------------
 
@@ -76,6 +84,14 @@ class _CapturingProvider:
         return self.response
 
 
+class _RecordingBackend(SandboxBackend):
+    name = "fake"
+    strongly_isolated = True
+
+    async def execute(self, request: ExecRequest, limits: SandboxLimits) -> ExecResult:
+        return ExecResult(0, "ok")
+
+
 # --- helpers -----------------------------------------------------------------
 
 
@@ -136,26 +152,77 @@ async def test_run_finished_event_published_on_success(tmp_path: Path) -> None:
 # 设计：运行实际 AgentLoop 成功路径，并从构建后的 registry 验证三种文件工具的工作区对象身份
 async def test_runner_uses_injected_workspace_for_run_and_registry(tmp_path: Path) -> None:
     workspace = WorkspaceFS(tmp_path)
+    backend = _RecordingBackend()
+    limits = SandboxLimits(17, 2_345, 384, 1.25, 40, 72)
+    runtime_dir = tmp_path / "runs" / ".sandbox-test"
     runner = AgentRunner(
         _config(),
         provider=_EndTurnProvider(),  # type: ignore[arg-type]
         runs_dir=tmp_path / "runs",
         workspace=workspace,
+        sandbox_backend=backend,
+        sandbox_limits=limits,
+        sandbox_runtime_dir=runtime_dir,
     )
 
     outcome = await runner.run_and_capture("goal")
-    registry = runner._build_registry(TaskManager(tmp_path / "tasks"))
+    registry = runner._build_registry(
+        TaskManager(tmp_path / "tasks"),
+        provider=_EndTurnProvider(),  # type: ignore[arg-type]
+        bus=EventBus(),
+        run_id="root-run",
+    )
     read_tool = registry.get("read_file")
+    bash_tool = registry.get("bash")
     write_tool = registry.get("write_file")
     list_tool = registry.get("list_dir")
+    spawn_tool = registry.get("spawn_agent")
 
     assert outcome.status == "success"
     assert isinstance(read_tool, ReadFileTool)
+    assert isinstance(bash_tool, BashTool)
     assert isinstance(write_tool, WriteFileTool)
     assert isinstance(list_tool, ListDirTool)
+    assert isinstance(spawn_tool, SpawnAgentTool)
     assert read_tool._workspace is workspace
+    assert bash_tool._workspace is workspace
+    assert bash_tool._backend is backend
+    assert bash_tool._limits is limits
+    assert bash_tool._env_allowlist is runner._env_allowlist
+    assert bash_tool._runtime_dir == runner._runtime_dir
     assert write_tool._workspace is workspace
     assert list_tool._workspace is workspace
+    assert spawn_tool._workspace is workspace
+    assert spawn_tool._sandbox_backend is backend
+    assert spawn_tool._sandbox_limits is limits
+    assert spawn_tool._env_allowlist is runner._env_allowlist
+    assert spawn_tool._runtime_dir is runner._runtime_dir
+    assert spawn_tool._runtime_dir == runtime_dir.resolve()
+    assert runtime_dir.is_dir()
+
+
+# 功能：未注入沙箱依赖时，Runner 从 config.sandbox 构造单一 workspace、limits 和 backend
+# 设计：使用自定义 workspace 和非默认限制，断言 HostBackend 运行根稳定位于 runs_dir 下
+def test_runner_constructs_sandbox_dependencies_from_config(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    runs_dir = tmp_path / "runs"
+    config = _config()
+    config.sandbox.workspace_root = str(workspace_root)
+    config.sandbox.timeout_s = 33
+    config.sandbox.output_limit_bytes = 4_321
+    config.sandbox.memory_mb = 640
+    config.sandbox.cpu_count = 1.75
+    config.sandbox.pids_limit = 52
+    config.sandbox.tmpfs_mb = 88
+
+    runner = AgentRunner(config, runs_dir=runs_dir)
+
+    assert runner._workspace.root == workspace_root.resolve()
+    assert isinstance(runner._sandbox_backend, HostBackend)
+    assert runner._sandbox_limits == SandboxLimits(33, 4_321, 640, 1.75, 52, 88)
+    assert runner._runtime_dir == (runs_dir / ".sandbox").resolve()
+    assert runner._runtime_dir.is_dir()
 
 
 # 功能：验证步数耗尽时 run.finished 携带 failed 状态和正确的失败原因
@@ -187,9 +254,12 @@ async def test_events_jsonl_created_with_started_and_finished(tmp_path: Path) ->
 # 设计：检查 tmp_path 下只有一个子目录且该目录包含 events.jsonl，确认目录结构约定（runs/<run_id>/events.jsonl）
 async def test_run_creates_run_subdirectory(tmp_path: Path) -> None:
     await _run(tmp_path=tmp_path)
-    subdirs = [p for p in tmp_path.iterdir() if p.is_dir()]
+    subdirs = [
+        p for p in tmp_path.iterdir() if p.is_dir() and not p.name.startswith(".")
+    ]
     assert len(subdirs) == 1
     assert (subdirs[0] / "events.jsonl").exists()
+    assert (tmp_path / ".sandbox").is_dir()
 
 
 # 功能：验证通过 extra_handlers 注入的回调能收到所有事件

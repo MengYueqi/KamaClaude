@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Collection
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -14,7 +15,7 @@ from kama_claude.core.events.bus import EventBus
 from kama_claude.core.events.writer import EventWriter
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.runs import new_run_id
-from kama_claude.core.sandbox import WorkspaceFS
+from kama_claude.core.sandbox import SandboxBackend, SandboxLimits, WorkspaceFS
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.tools.builtin.bash import BashTool
@@ -94,6 +95,10 @@ class SpawnAgentTool(BaseTool):
         runs_dir: Path,
         session_id: str,
         workspace: WorkspaceFS,
+        sandbox_backend: SandboxBackend,
+        sandbox_limits: SandboxLimits,
+        env_allowlist: Collection[str],
+        runtime_dir: Path,
         depth: int = 0,
     ) -> None:
         self._provider = provider
@@ -105,6 +110,10 @@ class SpawnAgentTool(BaseTool):
         self._runs_dir = runs_dir
         self._session_id = session_id
         self._workspace = workspace
+        self._sandbox_backend = sandbox_backend
+        self._sandbox_limits = sandbox_limits
+        self._env_allowlist = env_allowlist
+        self._runtime_dir = runtime_dir
         self._depth = depth
 
     # 派生子 agent，前台时阻塞直到完成并返回结果，后台时立即返回 run_id
@@ -239,7 +248,13 @@ class SpawnAgentTool(BaseTool):
         registry = ToolRegistry()
         _all_tools = [
             ReadFileTool(self._workspace),
-            BashTool(),
+            BashTool(
+                self._workspace,
+                self._sandbox_backend,
+                self._sandbox_limits,
+                self._env_allowlist,
+                self._runtime_dir,
+            ),
             WriteFileTool(self._workspace),
             ListDirTool(self._workspace),
         ]
@@ -268,6 +283,10 @@ class SpawnAgentTool(BaseTool):
                 runs_dir=self._runs_dir,
                 session_id=self._session_id,
                 workspace=self._workspace,
+                sandbox_backend=self._sandbox_backend,
+                sandbox_limits=self._sandbox_limits,
+                env_allowlist=self._env_allowlist,
+                runtime_dir=self._runtime_dir,
                 depth=self._depth + 1,
             )
             if _allowed("spawn_agent"):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from kama_claude.core.sandbox import (
     WorkspaceFS,
     WorkspaceViolationError,
 )
+from kama_claude.core.sandbox.host import HostBackend
 from kama_claude.core.tools.builtin.bash import BashTool
 from kama_claude.core.tools.builtin.list_dir import ListDirTool
 from kama_claude.core.tools.builtin.write_file import WriteFileTool
@@ -216,6 +218,58 @@ async def test_bash_sanitizes_unexpected_backend_exception(tmp_path: Path) -> No
     assert result.error_type == "runtime_error"
     assert result.content == "sandbox execution failed"
     assert "super-secret" not in result.content
+
+
+# 功能：调用方取消 BashTool 时必须原样传播取消，不能转成 runtime_error
+# 设计：后端在 Event 上阻塞并在 finally 记录取消，断言外层 task 抛 CancelledError
+@pytest.mark.asyncio
+async def test_bash_propagates_caller_cancellation(tmp_path: Path) -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class _BlockingBackend(SandboxBackend):
+        name = "fake"
+        strongly_isolated = True
+
+        async def execute(
+            self, request: ExecRequest, limits: SandboxLimits
+        ) -> ExecResult:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+    task = asyncio.create_task(
+        _bash_tool(tmp_path, _BlockingBackend()).invoke({"command": "wait"})
+    )
+    await started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert cancelled.is_set()
+
+
+# 功能：BashTool 可与真实 HostBackend 组合，并在注入 workspace cwd 执行无害命令
+# 设计：只执行 shell 内建 printf，运行目录与工作区都使用隔离 tmp_path，不访问网络
+@pytest.mark.asyncio
+async def test_bash_composes_with_real_host_backend(tmp_path: Path) -> None:
+    runtime_dir = tmp_path / ".runtime"
+    runtime_dir.mkdir()
+    tool = BashTool(
+        WorkspaceFS(tmp_path),
+        HostBackend(runtime_dir),
+        _limits(timeout_s=5),
+        (),
+        runtime_dir,
+    )
+
+    result = await tool.invoke({"command": "printf host-composition"})
+
+    assert not result.is_error
+    assert result.content == "host-composition"
 
 
 # ── write_file ────────────────────────────────────────────────────────────────

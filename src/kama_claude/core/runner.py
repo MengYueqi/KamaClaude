@@ -19,7 +19,12 @@ from kama_claude.core.mcp.server import McpServerManager
 from kama_claude.core.memory.loader import load_context_file
 from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.runs import RUNS_DIR, new_run_id
-from kama_claude.core.sandbox import WorkspaceFS
+from kama_claude.core.sandbox import (
+    SandboxBackend,
+    SandboxLimits,
+    WorkspaceFS,
+    create_sandbox_backend,
+)
 from kama_claude.core.session.model import Session
 from kama_claude.core.session.store import SessionStore
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
@@ -66,6 +71,9 @@ class AgentRunner:
         permission_manager: PermissionManager | None = None,
         mcp_manager: McpServerManager | None = None,
         workspace: WorkspaceFS | None = None,
+        sandbox_backend: SandboxBackend | None = None,
+        sandbox_limits: SandboxLimits | None = None,
+        sandbox_runtime_dir: Path | None = None,
     ) -> None:
         self._config = config
         self._bus = bus
@@ -75,7 +83,38 @@ class AgentRunner:
         self._trace = trace
         self._permission_manager = permission_manager
         self._mcp_manager = mcp_manager
-        self._workspace = workspace or WorkspaceFS(Path.cwd())
+        self._workspace = (
+            workspace
+            if workspace is not None
+            else WorkspaceFS(Path(config.sandbox.workspace_root))
+        )
+        runtime_dir = (
+            sandbox_runtime_dir
+            if sandbox_runtime_dir is not None
+            else self._runs_dir / ".sandbox"
+        )
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        self._runtime_dir = runtime_dir.resolve()
+        self._sandbox_limits = (
+            sandbox_limits
+            if sandbox_limits is not None
+            else SandboxLimits(
+                timeout_s=config.sandbox.timeout_s,
+                output_limit_bytes=config.sandbox.output_limit_bytes,
+                memory_mb=config.sandbox.memory_mb,
+                cpu_count=config.sandbox.cpu_count,
+                pids_limit=config.sandbox.pids_limit,
+                tmpfs_mb=config.sandbox.tmpfs_mb,
+            )
+        )
+        self._env_allowlist = tuple(config.sandbox.env_allowlist)
+        self._sandbox_backend = (
+            sandbox_backend
+            if sandbox_backend is not None
+            else create_sandbox_backend(
+                config.sandbox, self._workspace, self._runtime_dir
+            )
+        )
         # 跨 run 共享的后台 subagent 任务注册表
         self._task_registry = BackgroundTaskRegistry()
 
@@ -101,7 +140,13 @@ class AgentRunner:
         registry = ToolRegistry()
         for t in [
             ReadFileTool(self._workspace),
-            BashTool(),
+            BashTool(
+                self._workspace,
+                self._sandbox_backend,
+                self._sandbox_limits,
+                self._env_allowlist,
+                self._runtime_dir,
+            ),
             WriteFileTool(self._workspace),
             ListDirTool(self._workspace),
         ]:
@@ -133,6 +178,10 @@ class AgentRunner:
                         runs_dir=runs_dir,
                         session_id=session_id,
                         workspace=self._workspace,
+                        sandbox_backend=self._sandbox_backend,
+                        sandbox_limits=self._sandbox_limits,
+                        env_allowlist=self._env_allowlist,
+                        runtime_dir=self._runtime_dir,
                         depth=0,
                     )
                 )
