@@ -46,9 +46,7 @@ def test_factory_docker_config_never_falls_back_to_host(tmp_path: Path) -> None:
         "kama-0123456789abcdef",
     )
     assert argv[argv.index("--network") + 1] == "bridge"
-    assert argv[argv.index("--mount") + 1] == (
-        f"type=bind,src={tmp_path.resolve()},dst=/workspace,rw"
-    )
+    assert argv[argv.index("--mount") + 1] == (f"type=bind,src={tmp_path.resolve()},dst=/workspace")
     assert argv[-4] == "isolated:latest"
 
 
