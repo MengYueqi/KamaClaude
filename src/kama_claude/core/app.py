@@ -43,6 +43,12 @@ from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.permissions.storage import load_policy_file
 from kama_claude.core.runner import AgentRunner
 from kama_claude.core.runs import events_file, new_run_id
+from kama_claude.core.sandbox import (
+    SandboxBackend,
+    SandboxLimits,
+    WorkspaceFS,
+    create_sandbox_backend,
+)
 from kama_claude.core.session import SessionManager, SessionStore
 from kama_claude.core.trace.record import TraceRecord
 from kama_claude.core.trace.writer import TraceWriter
@@ -208,88 +214,149 @@ class CoreApp:
     # 启动守护进程：加载配置、初始化日志、启动 trace、启动 TCP 服务器，并等待退出信号
     async def run(self) -> None:
         self._start_time = time.monotonic()
-        self._config = get_config()
-        setup_logging(self._config)
+        config = get_config()
+        self._config = config
+        setup_logging(config)
+        backend: SandboxBackend | None = None
+        server: SocketServer | None = None
+        primary_error: BaseException | None = None
 
-        if self._config.trace.enabled:
-            trace_path = Path(self._config.trace.file).expanduser()
-            self._trace = TraceWriter(trace_path)
-            await self._trace.start()
-            self._bus.subscribe(self._trace_event_handler)
+        try:
+            workspace = WorkspaceFS(Path(config.sandbox.workspace_root))
+            sessions_root = Path("~/.kama/sessions").expanduser()
+            runtime_dir = sessions_root / ".sandbox"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            runtime_dir = runtime_dir.resolve()
+            limits = SandboxLimits(
+                timeout_s=config.sandbox.timeout_s,
+                output_limit_bytes=config.sandbox.output_limit_bytes,
+                memory_mb=config.sandbox.memory_mb,
+                cpu_count=config.sandbox.cpu_count,
+                pids_limit=config.sandbox.pids_limit,
+                tmpfs_mb=config.sandbox.tmpfs_mb,
+            )
+            backend = create_sandbox_backend(
+                config.sandbox, workspace, runtime_dir
+            )
+            network_state = (
+                f" network={str(config.sandbox.network).lower()}"
+                if backend.name == "docker"
+                else ""
+            )
+            logger.info(
+                "sandbox backend=%s strongly_isolated=%s workspace=%s%s",
+                backend.name,
+                str(backend.strongly_isolated).lower(),
+                workspace.root,
+                network_state,
+            )
 
-        policy_file = Path("~/.kama/policy.toml").expanduser()
-        self._permission_manager = PermissionManager(
-            policy_file=policy_file,
-            timeout_s=self._config.permission.timeout_s,
-        )
-        logger.info(
-            "permission manager: timeout_s=%.1f  persistent=%d entries",
-            self._config.permission.timeout_s,
-            len(load_policy_file(policy_file)),
-        )
+            if config.trace.enabled:
+                trace_path = Path(config.trace.file).expanduser()
+                self._trace = TraceWriter(trace_path)
+                await self._trace.start()
+                self._bus.subscribe(self._trace_event_handler)
 
-        self._broadcaster = IpcEventBroadcaster(trace=self._trace)
-        self._bus.subscribe(self._broadcaster.handle)
-        sessions_root = Path("~/.kama/sessions").expanduser()
-        store = SessionStore(sessions_root)
-        assert self._config is not None
-        compact_provider = AnthropicProvider(self._config.llm.default_model)
+            policy_file = Path("~/.kama/policy.toml").expanduser()
+            self._permission_manager = PermissionManager(
+                policy_file=policy_file,
+                timeout_s=config.permission.timeout_s,
+            )
+            logger.info(
+                "permission manager: timeout_s=%.1f  persistent=%d entries",
+                config.permission.timeout_s,
+                len(load_policy_file(policy_file)),
+            )
 
-        self._mcp_manager = McpServerManager()
-        if self._config.mcp.servers:
-            logger.info("mcp: starting %d server(s)", len(self._config.mcp.servers))
-            await self._mcp_manager.start_all(self._config.mcp.servers)
+            self._broadcaster = IpcEventBroadcaster(trace=self._trace)
+            self._bus.subscribe(self._broadcaster.handle)
+            store = SessionStore(sessions_root)
+            compact_provider = AnthropicProvider(config.llm.default_model)
 
-        self._sessions = SessionManager(
-            store,
-            runner_factory=lambda: AgentRunner(
-                self._config,  # type: ignore[arg-type]
+            self._mcp_manager = McpServerManager()
+            if config.mcp.servers:
+                logger.info("mcp: starting %d server(s)", len(config.mcp.servers))
+                await self._mcp_manager.start_all(config.mcp.servers)
+
+            self._sessions = SessionManager(
+                store,
+                runner_factory=lambda: AgentRunner(
+                    config,
+                    bus=self._bus,
+                    trace=self._trace,
+                    permission_manager=self._permission_manager,
+                    mcp_manager=self._mcp_manager,
+                    workspace=workspace,
+                    sandbox_backend=backend,
+                    sandbox_limits=limits,
+                    sandbox_runtime_dir=runtime_dir,
+                ),
                 bus=self._bus,
+                provider=compact_provider,
+            )
+
+            server = SocketServer(
+                config.host,
+                config.port,
+                self._broadcaster,
                 trace=self._trace,
-                permission_manager=self._permission_manager,
-                mcp_manager=self._mcp_manager,
-            ),
-            bus=self._bus,
-            provider=compact_provider,
-        )
+            )
+            server.register("core.ping", self._ping_handler)
+            server.register("agent.run", self._agent_run_handler)
+            server.register("event.subscribe", self._subscribe_handler)
+            server.register("session.create", self._session_create_handler)
+            server.register("session.send_message", self._session_send_handler)
+            server.register("session.get_history", self._session_history_handler)
+            server.register("session.close", self._session_close_handler)
+            server.register("permission.respond", self._permission_respond_handler)
+            server.register("session.compact", self._session_compact_handler)
 
-        server = SocketServer(
-            self._config.host,
-            self._config.port,
-            self._broadcaster,
-            trace=self._trace,
-        )
-        server.register("core.ping", self._ping_handler)
-        server.register("agent.run", self._agent_run_handler)
-        server.register("event.subscribe", self._subscribe_handler)
-        server.register("session.create", self._session_create_handler)
-        server.register("session.send_message", self._session_send_handler)
-        server.register("session.get_history", self._session_history_handler)
-        server.register("session.close", self._session_close_handler)
-        server.register("permission.respond", self._permission_respond_handler)
-        server.register("session.compact", self._session_compact_handler)
+            addr = await server.start()
+            logger.info("kama-core %s listening addr=%s", kama_claude.__version__, addr)
 
-        addr = await server.start()
-        logger.info("kama-core %s listening addr=%s", kama_claude.__version__, addr)
-        logger.info("config: %s", self._config)
+            loop = asyncio.get_running_loop()
+            shutdown = asyncio.Event()
+            loop.add_signal_handler(signal.SIGINT, shutdown.set)
+            loop.add_signal_handler(signal.SIGTERM, shutdown.set)
 
-        loop = asyncio.get_running_loop()
-        shutdown = asyncio.Event()
-        loop.add_signal_handler(signal.SIGINT, shutdown.set)
-        loop.add_signal_handler(signal.SIGTERM, shutdown.set)
+            await shutdown.wait()
+            logger.info("shutting down")
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            cleanup_errors: list[tuple[str, BaseException]] = []
 
-        await shutdown.wait()
+            async def _cleanup(name: str, operation: Any) -> None:
+                try:
+                    await operation()
+                except BaseException as exc:
+                    logger.exception("%s cleanup failed", name)
+                    cleanup_errors.append((name, exc))
 
-        logger.info("shutting down")
-        for run_task in list(self._running_runs):
-            run_task.cancel()
-        if self._running_runs:
-            await asyncio.gather(*self._running_runs, return_exceptions=True)
-        if self._mcp_manager is not None:
-            await self._mcp_manager.stop_all()
-        await server.stop()
-        if self._trace is not None:
-            await self._trace.stop()
+            for run_task in list(self._running_runs):
+                run_task.cancel()
+            if self._running_runs:
+                await asyncio.gather(*self._running_runs, return_exceptions=True)
+            if self._mcp_manager is not None:
+                await _cleanup("mcp", self._mcp_manager.stop_all)
+            if server is not None:
+                await _cleanup("server", server.stop)
+            if backend is not None:
+                await _cleanup("sandbox backend", backend.close)
+            if self._trace is not None:
+                await _cleanup("trace", self._trace.stop)
+
+            if cleanup_errors:
+                if primary_error is not None:
+                    for name, error in cleanup_errors:
+                        primary_error.add_note(f"{name} cleanup failed: {error}")
+                else:
+                    first_name, first_error = cleanup_errors[0]
+                    for name, error in cleanup_errors[1:]:
+                        first_error.add_note(f"{name} cleanup failed: {error}")
+                    first_error.add_note(f"cleanup component: {first_name}")
+                    raise first_error
 
 
 # 同步入口：启动 CoreApp 事件循环
