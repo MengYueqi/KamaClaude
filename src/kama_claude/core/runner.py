@@ -74,6 +74,7 @@ class AgentRunner:
         sandbox_backend: SandboxBackend | None = None,
         sandbox_limits: SandboxLimits | None = None,
         sandbox_runtime_dir: Path | None = None,
+        task_registry: BackgroundTaskRegistry | None = None,
     ) -> None:
         self._config = config
         self._bus = bus
@@ -116,7 +117,9 @@ class AgentRunner:
             )
         )
         # 跨 run 共享的后台 subagent 任务注册表
-        self._task_registry = BackgroundTaskRegistry()
+        self._task_registry = (
+            task_registry if task_registry is not None else BackgroundTaskRegistry()
+        )
 
     # 构建工具注册表，注入 TaskManager（任务工具共享同一实例）；可选注入 SpawnAgentTool
     def _build_registry(

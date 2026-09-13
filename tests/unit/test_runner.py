@@ -17,6 +17,7 @@ from kama_claude.core.sandbox import (
     WorkspaceFS,
 )
 from kama_claude.core.sandbox.host import HostBackend
+from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.subagent.tool import SpawnAgentTool
 from kama_claude.core.task.manager import TaskManager
 from kama_claude.core.tools.builtin import BashTool, ListDirTool, ReadFileTool, WriteFileTool
@@ -155,6 +156,7 @@ async def test_runner_uses_injected_workspace_for_run_and_registry(tmp_path: Pat
     backend = _RecordingBackend()
     limits = SandboxLimits(17, 2_345, 384, 1.25, 40, 72)
     runtime_dir = tmp_path / "runs" / ".sandbox-test"
+    task_registry = BackgroundTaskRegistry()
     runner = AgentRunner(
         _config(),
         provider=_EndTurnProvider(),  # type: ignore[arg-type]
@@ -163,6 +165,7 @@ async def test_runner_uses_injected_workspace_for_run_and_registry(tmp_path: Pat
         sandbox_backend=backend,
         sandbox_limits=limits,
         sandbox_runtime_dir=runtime_dir,
+        task_registry=task_registry,
     )
 
     outcome = await runner.run_and_capture("goal")
@@ -179,6 +182,7 @@ async def test_runner_uses_injected_workspace_for_run_and_registry(tmp_path: Pat
     spawn_tool = registry.get("spawn_agent")
 
     assert outcome.status == "success"
+    assert runner._task_registry is task_registry
     assert isinstance(read_tool, ReadFileTool)
     assert isinstance(bash_tool, BashTool)
     assert isinstance(write_tool, WriteFileTool)
@@ -198,6 +202,7 @@ async def test_runner_uses_injected_workspace_for_run_and_registry(tmp_path: Pat
     assert spawn_tool._env_allowlist is runner._env_allowlist
     assert spawn_tool._runtime_dir is runner._runtime_dir
     assert spawn_tool._runtime_dir == runtime_dir.resolve()
+    assert spawn_tool._task_registry is task_registry
     assert runtime_dir.is_dir()
 
 

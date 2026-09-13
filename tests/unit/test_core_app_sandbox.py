@@ -8,7 +8,10 @@ from pathlib import Path
 import pytest
 
 import kama_claude.core.app as app_module
+from kama_claude.core.bus.envelope import HandlerError
 from kama_claude.core.config import KamaConfig, McpServerConfig
+from kama_claude.core.context import ExecutionContext
+from kama_claude.core.events.bus import EventBus
 from kama_claude.core.sandbox import (
     ExecRequest,
     ExecResult,
@@ -16,6 +19,8 @@ from kama_claude.core.sandbox import (
     SandboxLimits,
     WorkspaceFS,
 )
+from kama_claude.core.subagent.registry import BackgroundTaskRegistry
+from kama_claude.core.subagent.tool import SpawnAgentTool
 
 
 class _Backend(SandboxBackend):
@@ -278,6 +283,9 @@ async def test_core_app_constructs_and_shares_one_sandbox_dependency_set(
     )
     assert first_kwargs["sandbox_runtime_dir"] is runtime_dir
     assert second_kwargs["sandbox_runtime_dir"] is runtime_dir
+    task_registry = first_kwargs["task_registry"]
+    assert isinstance(task_registry, BackgroundTaskRegistry)
+    assert second_kwargs["task_registry"] is task_registry
 
 
 # 功能：启动日志必须准确呈现后端隔离状态，Docker 额外显示网络状态，同时不得泄露环境值
@@ -362,10 +370,195 @@ async def test_core_app_reaps_active_runs_before_single_backend_close_and_trace_
     assert events.index("backend.close") < events.index("trace.stop")
 
 
+# 功能：直接 session.send_message handler 的完整执行期必须纳入关闭收割范围
+# 设计：运行真实 CoreApp handler 并阻塞其 SessionManager await，随后触发真实 run 清理验证跟踪、取消和顺序
+async def test_core_app_tracks_and_reaps_blocking_session_send_handler_before_close(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    real_event = asyncio.Event
+    started = real_event()
+    events: list[str] = []
+
+    class _BlockingSessions:
+        async def send_message(self, session_id: str, content: str) -> str:
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                events.append("session-send.reaped")
+
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    config = _config(workspace_root)
+    backend = _Backend(events, name="host", strongly_isolated=False)
+    _install_fakes(monkeypatch, tmp_path, config, backend, events)
+    app = app_module.CoreApp()
+    app._sessions = _BlockingSessions()  # type: ignore[assignment]
+    handler_task = asyncio.create_task(
+        app._session_send_handler(
+            {"session_id": "sess-test", "content": "run until shutdown"}
+        )
+    )
+    await started.wait()
+
+    assert handler_task in app._running_runs
+    await app.run()
+
+    assert handler_task.cancelled()
+    assert events.index("session-send.reaped") < events.index("backend.close")
+    assert events.index("backend.close") < events.index("trace.stop")
+
+
+# 功能：CoreApp 共享注册表中的后台 Subagent 必须在 Backend 关闭前取消并收割
+# 设计：经真实 BackgroundTaskRegistry.register 注册阻塞任务，同时验证每个 Runner 获得同一注册表实例
+async def test_core_app_reaps_shared_background_registry_before_backend_close(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    real_event = asyncio.Event
+    provider_started = real_event()
+    events: list[str] = []
+
+    class _BlockingProvider:
+        async def chat(self, *args: object, **kwargs: object) -> object:
+            provider_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                events.append("background.reaped")
+
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    config = _config(workspace_root)
+    backend = _Backend(events, name="host", strongly_isolated=False)
+    _install_fakes(monkeypatch, tmp_path, config, backend, events)
+    app = app_module.CoreApp()
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    spawn_tool = SpawnAgentTool(
+        provider=_BlockingProvider(),  # type: ignore[arg-type]
+        parent_bus=EventBus(),
+        parent_run_id="parent-run",
+        permission_manager=None,
+        max_steps=1,
+        task_registry=app._task_registry,
+        runs_dir=tmp_path / "child-runs",
+        session_id="sess-test",
+        workspace=WorkspaceFS(workspace_root),
+        sandbox_backend=backend,
+        sandbox_limits=SandboxLimits(10, 1_024, 128, 1.0, 16, 32),
+        env_allowlist=("PATH",),
+        runtime_dir=runtime_dir,
+    )
+    result = await spawn_tool.invoke(
+        {
+            "description": "blocking child",
+            "prompt": "wait for shutdown",
+            "run_in_background": True,
+        }
+    )
+    run_id = result.content.split("run_id=")[1].split(".")[0]
+    entry = app._task_registry.get(run_id)
+    assert entry is not None
+    background_task, _context = entry
+    await provider_started.wait()
+
+    await app.run()
+
+    assert background_task.cancelled()
+    assert all(
+        call[1]["task_registry"] is app._task_registry for call in _Runner.calls
+    )
+    assert events.index("background.reaped") < events.index("backend.close")
+    assert events.index("backend.close") < events.index("trace.stop")
+
+
+# 功能：后台任务在取消处理里新注册的嵌套任务也必须在 Backend 关闭前被发现并收割
+# 设计：首个注册任务收到取消后同步注册并启动第二个任务；此用例会击穿只读取一次 registry 快照的实现
+async def test_core_app_drains_background_tasks_registered_during_quiescing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    config = _config(workspace_root)
+    events: list[str] = []
+    backend = _Backend(events, name="host", strongly_isolated=False)
+    _install_fakes(monkeypatch, tmp_path, config, backend, events)
+    app = app_module.CoreApp()
+    late_tasks: list[asyncio.Task[None]] = []
+
+    async def _late_background() -> None:
+        try:
+            await asyncio.Future()
+        finally:
+            events.append("late-background.reaped")
+
+    async def _register_during_cancel() -> None:
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            late_task = asyncio.create_task(_late_background())
+            late_tasks.append(late_task)
+            app._task_registry.register(
+                "late-background",
+                late_task,
+                ExecutionContext(
+                    run_id="late-background", goal="nested", max_steps=1
+                ),
+            )
+            await asyncio.sleep(0)
+            events.append("first-background.reaped")
+            raise
+
+    first_task = asyncio.create_task(_register_during_cancel())
+    await asyncio.sleep(0)
+    app._task_registry.register(
+        "first-background",
+        first_task,
+        ExecutionContext(run_id="first-background", goal="root", max_steps=1),
+    )
+
+    try:
+        await app.run()
+        assert len(late_tasks) == 1
+        assert late_tasks[0].cancelled()
+        assert events.index("late-background.reaped") < events.index("backend.close")
+    finally:
+        for task in late_tasks:
+            if not task.done():
+                task.cancel()
+        if late_tasks:
+            await asyncio.gather(*late_tasks, return_exceptions=True)
+
+
+# 功能：关闭门一旦升起，所有可能启动 Runner 的 handler 必须立即拒绝新工作
+# 设计：完成一次真实 CoreApp.run 后直接调用两个生产 handler，验证在触及 SessionManager 前返回稳定结构化错误
+async def test_core_app_gates_new_agent_and_session_runs_after_shutdown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    config = _config(workspace_root)
+    events: list[str] = []
+    backend = _Backend(events, name="host", strongly_isolated=False)
+    _install_fakes(monkeypatch, tmp_path, config, backend, events)
+    app = app_module.CoreApp()
+
+    await app.run()
+
+    with pytest.raises(HandlerError, match="core shutting down"):
+        await app._agent_run_handler({"goal": "too late"})
+    with pytest.raises(HandlerError, match="core shutting down"):
+        await app._session_send_handler(
+            {"session_id": "sess-test", "content": "too late"}
+        )
+
+
 # 功能：backend 构造后的启动异常仍必须执行全部清理，并保留启动异常作为主异常
 # 设计：让 MCP 启动与清理都失败；断言原始启动异常传播，backend/trace 不因清理异常而泄漏
 async def test_core_app_preserves_startup_error_while_cleanup_still_closes_backend(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
@@ -380,8 +573,9 @@ async def test_core_app_preserves_startup_error_while_cleanup_still_closes_backe
         backend,
         events,
         mcp_start_error=RuntimeError("mcp startup primary"),
-        mcp_stop_error=RuntimeError("mcp cleanup secondary"),
+        mcp_stop_error=ValueError("SECRET cleanup detail"),
     )
+    caplog.set_level(logging.ERROR, logger=app_module.__name__)
 
     with pytest.raises(RuntimeError, match="mcp startup primary") as caught:
         await app_module.CoreApp().run()
@@ -390,7 +584,9 @@ async def test_core_app_preserves_startup_error_while_cleanup_still_closes_backe
     assert events.count("backend.close") == 1
     assert events.index("mcp.stop") < events.index("backend.close")
     assert events.index("backend.close") < events.index("trace.stop")
-    assert any("mcp cleanup secondary" in note for note in caught.value.__notes__)
+    assert caught.value.__notes__ == ["mcp cleanup failed (ValueError)"]
+    assert "SECRET" not in caplog.text
+    assert all("SECRET" not in note for note in caught.value.__notes__)
 
 
 # 功能：某个正常关闭组件失败时仍须关闭 backend 和 trace，并向调用者暴露首个清理错误
@@ -417,4 +613,49 @@ async def test_core_app_cleanup_error_does_not_skip_backend_or_trace(
 
     assert backend.close_calls == 1
     assert events.index("server.stop") < events.index("backend.close")
+    assert events.index("backend.close") < events.index("trace.stop")
+
+
+# 功能：清理过程中即使外层连续取消，独立清理任务也必须完成后再传播 CancelledError
+# 设计：让被收割运行任务阻塞在取消处理内，连续取消 CoreApp.run 两次后释放并验证 Backend/Trace 顺序
+async def test_core_app_repeated_cancellation_cannot_interrupt_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    real_event = asyncio.Event
+    cleanup_blocked = real_event()
+    release_cleanup = real_event()
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    config = _config(workspace_root)
+    events: list[str] = []
+    backend = _Backend(events, name="host", strongly_isolated=False)
+    _install_fakes(monkeypatch, tmp_path, config, backend, events)
+    app = app_module.CoreApp()
+
+    async def _slow_to_reap() -> None:
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cleanup_blocked.set()
+            await release_cleanup.wait()
+            events.append("run.reaped")
+            raise
+
+    active_task = asyncio.create_task(_slow_to_reap())
+    await asyncio.sleep(0)
+    app._running_runs.add(active_task)
+    app_task = asyncio.create_task(app.run())
+    await cleanup_blocked.wait()
+
+    app_task.cancel()
+    await asyncio.sleep(0)
+    app_task.cancel()
+    await asyncio.sleep(0)
+    release_cleanup.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(app_task, timeout=1)
+
+    assert active_task.cancelled()
+    assert events.index("run.reaped") < events.index("backend.close")
     assert events.index("backend.close") < events.index("trace.stop")

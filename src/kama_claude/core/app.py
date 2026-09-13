@@ -7,6 +7,7 @@ import json
 import logging
 import signal
 import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC
 from pathlib import Path
 from typing import Any
@@ -33,7 +34,7 @@ from kama_claude.core.bus.commands import (
     SessionSendMessageCommand,
     SessionSendMessageResult,
 )
-from kama_claude.core.bus.envelope import EventPushEnvelope
+from kama_claude.core.bus.envelope import INTERNAL_ERROR, EventPushEnvelope, HandlerError
 from kama_claude.core.config import KamaConfig, get_config
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.provider import AnthropicProvider
@@ -50,6 +51,7 @@ from kama_claude.core.sandbox import (
     create_sandbox_backend,
 )
 from kama_claude.core.session import SessionManager, SessionStore
+from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.trace.record import TraceRecord
 from kama_claude.core.trace.writer import TraceWriter
 from kama_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
@@ -73,6 +75,21 @@ class CoreApp:
         self._sessions: SessionManager | None = None
         self._permission_manager: PermissionManager | None = None
         self._mcp_manager: McpServerManager | None = None
+        self._task_registry = BackgroundTaskRegistry()
+        self._shutting_down = False
+
+    # 拒绝在关闭门升起后启动任何可能使用共享 Backend 的新运行
+    def _ensure_accepting_runs(self) -> None:
+        if self._shutting_down:
+            raise HandlerError(INTERNAL_ERROR, "core shutting down")
+
+    # 将当前请求 handler 纳入 daemon 的运行任务生命周期；调用方必须在 finally 中移除
+    def _track_current_handler(self) -> asyncio.Task[Any]:
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("run handler requires an asyncio task")
+        self._running_runs.add(task)
+        return task
 
     # 处理 core.ping 请求，返回服务版本、运行时长和接收时间
     async def _ping_handler(self, params: dict[str, Any]) -> PongResult:
@@ -101,16 +118,22 @@ class CoreApp:
 
     # 启动一次 agent run：异步创建 AgentRunner 并立即返回 run_id
     async def _agent_run_handler(self, params: dict[str, Any]) -> AgentRunResult:
-        assert self._sessions is not None
-        cmd = AgentRunCommand.model_validate(params)
-        session = await self._sessions.create(mode="one_shot", title=cmd.goal[:40])
-        run_id = new_run_id()
-        run_task = asyncio.create_task(
-            self._sessions.send_message(session.id, cmd.goal, run_id=run_id)
-        )
-        self._running_runs.add(run_task)
-        run_task.add_done_callback(self._running_runs.discard)
-        return AgentRunResult(run_id=run_id)
+        self._ensure_accepting_runs()
+        handler_task = self._track_current_handler()
+        try:
+            assert self._sessions is not None
+            cmd = AgentRunCommand.model_validate(params)
+            session = await self._sessions.create(mode="one_shot", title=cmd.goal[:40])
+            self._ensure_accepting_runs()
+            run_id = new_run_id()
+            run_task = asyncio.create_task(
+                self._sessions.send_message(session.id, cmd.goal, run_id=run_id)
+            )
+            self._running_runs.add(run_task)
+            run_task.add_done_callback(self._running_runs.discard)
+            return AgentRunResult(run_id=run_id)
+        finally:
+            self._running_runs.discard(handler_task)
 
     # 创建 chat 或 one_shot session，并返回 session_id
     async def _session_create_handler(self, params: dict[str, Any]) -> SessionCreateResult:
@@ -121,10 +144,68 @@ class CoreApp:
 
     # 向 session 发送一条用户消息并同步等待对应 run 完成
     async def _session_send_handler(self, params: dict[str, Any]) -> SessionSendMessageResult:
-        assert self._sessions is not None
-        cmd = SessionSendMessageCommand.model_validate(params)
-        run_id = await self._sessions.send_message(cmd.session_id, cmd.content)
-        return SessionSendMessageResult(run_id=run_id)
+        self._ensure_accepting_runs()
+        handler_task = self._track_current_handler()
+        try:
+            assert self._sessions is not None
+            cmd = SessionSendMessageCommand.model_validate(params)
+            run_id = await self._sessions.send_message(cmd.session_id, cmd.content)
+            return SessionSendMessageResult(run_id=run_id)
+        finally:
+            self._running_runs.discard(handler_task)
+
+    # 执行一个清理组件并记录稳定的组件名/异常类型；禁止将任意异常文本写入日志
+    async def _attempt_cleanup(
+        self,
+        name: str,
+        operation: Callable[[], Awaitable[None]],
+        errors: list[tuple[str, BaseException]],
+    ) -> None:
+        try:
+            await operation()
+        except BaseException as exc:
+            logger.error("%s cleanup failed error_type=%s", name, type(exc).__name__)
+            errors.append((name, exc))
+
+    # 关闭时先收割所有 Backend 使用者，再按固定顺序释放外围资源
+    async def _cleanup_runtime(
+        self,
+        mcp_manager: McpServerManager | None,
+        server: SocketServer | None,
+        backend: SandboxBackend | None,
+        trace: TraceWriter | None,
+    ) -> list[tuple[str, BaseException]]:
+        errors: list[tuple[str, BaseException]] = []
+        current = asyncio.current_task()
+        run_tasks = [task for task in self._running_runs if task is not current]
+        for task in run_tasks:
+            task.cancel()
+        if run_tasks:
+            await asyncio.gather(*run_tasks, return_exceptions=True)
+
+        reaped_background: set[asyncio.Task[None]] = set()
+        while True:
+            background_tasks = [
+                task
+                for task, _context in self._task_registry.all()
+                if task not in reaped_background and task is not current
+            ]
+            if not background_tasks:
+                break
+            for task in background_tasks:
+                task.cancel()
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+            reaped_background.update(background_tasks)
+
+        if mcp_manager is not None:
+            await self._attempt_cleanup("mcp", mcp_manager.stop_all, errors)
+        if server is not None:
+            await self._attempt_cleanup("server", server.stop, errors)
+        if backend is not None:
+            await self._attempt_cleanup("sandbox backend", backend.close, errors)
+        if trace is not None:
+            await self._attempt_cleanup("trace", trace.stop, errors)
+        return errors
 
     # 返回 session 的完整 Anthropic messages 历史
     async def _session_history_handler(self, params: dict[str, Any]) -> SessionGetHistoryResult:
@@ -214,6 +295,7 @@ class CoreApp:
     # 启动守护进程：加载配置、初始化日志、启动 trace、启动 TCP 服务器，并等待退出信号
     async def run(self) -> None:
         self._start_time = time.monotonic()
+        self._shutting_down = False
         config = get_config()
         self._config = config
         setup_logging(config)
@@ -290,6 +372,7 @@ class CoreApp:
                     sandbox_backend=backend,
                     sandbox_limits=limits,
                     sandbox_runtime_dir=runtime_dir,
+                    task_registry=self._task_registry,
                 ),
                 bus=self._bus,
                 provider=compact_provider,
@@ -323,40 +406,31 @@ class CoreApp:
             logger.info("shutting down")
         except BaseException as exc:
             primary_error = exc
-            raise
-        finally:
-            cleanup_errors: list[tuple[str, BaseException]] = []
 
-            async def _cleanup(name: str, operation: Any) -> None:
-                try:
-                    await operation()
-                except BaseException as exc:
-                    logger.exception("%s cleanup failed", name)
-                    cleanup_errors.append((name, exc))
+        # 同步升起关闭门后再创建独立清理任务，之间没有 await，因此新 handler 无法越过快照边界
+        self._shutting_down = True
+        cleanup_task = asyncio.create_task(
+            self._cleanup_runtime(self._mcp_manager, server, backend, self._trace)
+        )
+        while True:
+            try:
+                cleanup_errors = await asyncio.shield(cleanup_task)
+                break
+            except asyncio.CancelledError as exc:
+                if primary_error is None:
+                    primary_error = exc
+                continue
 
-            for run_task in list(self._running_runs):
-                run_task.cancel()
-            if self._running_runs:
-                await asyncio.gather(*self._running_runs, return_exceptions=True)
-            if self._mcp_manager is not None:
-                await _cleanup("mcp", self._mcp_manager.stop_all)
-            if server is not None:
-                await _cleanup("server", server.stop)
-            if backend is not None:
-                await _cleanup("sandbox backend", backend.close)
-            if self._trace is not None:
-                await _cleanup("trace", self._trace.stop)
-
-            if cleanup_errors:
-                if primary_error is not None:
-                    for name, error in cleanup_errors:
-                        primary_error.add_note(f"{name} cleanup failed: {error}")
-                else:
-                    first_name, first_error = cleanup_errors[0]
-                    for name, error in cleanup_errors[1:]:
-                        first_error.add_note(f"{name} cleanup failed: {error}")
-                    first_error.add_note(f"cleanup component: {first_name}")
-                    raise first_error
+        if primary_error is not None:
+            for name, error in cleanup_errors:
+                primary_error.add_note(f"{name} cleanup failed ({type(error).__name__})")
+            raise primary_error
+        if cleanup_errors:
+            first_name, first_error = cleanup_errors[0]
+            first_error.add_note(f"cleanup component: {first_name}")
+            for name, error in cleanup_errors[1:]:
+                first_error.add_note(f"{name} cleanup failed ({type(error).__name__})")
+            raise first_error
 
 
 # 同步入口：启动 CoreApp 事件循环
