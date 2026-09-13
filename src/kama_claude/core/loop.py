@@ -25,8 +25,7 @@ def _now() -> str:
 
 
 class AgentLoop:
-    # 初始化循环所需依赖：LLM provider、工具注册表、事件总线，以及可选的权限管理器、压缩器和
-    # session ID
+    # 初始化循环依赖：LLM、工具、事件及可选权限管理器、压缩器和 session ID
     def __init__(
         self,
         provider: LLMProvider,

@@ -92,8 +92,7 @@ class McpClient:
             ))
         return tools
 
-    # 调用 MCP server 上的工具，返回所有 text 内容拼接；连接异常抛
-    # McpServerUnavailableError，工具错误抛 McpToolError
+    # 调用工具并拼接 text；连接异常抛 McpServerUnavailableError，工具错误抛 McpToolError
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
         response = await self._call("tools/call", {"name": name, "arguments": arguments})
         parts: list[str] = []

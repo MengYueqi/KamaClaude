@@ -266,6 +266,29 @@ def test_build_argv_applies_every_strong_isolation_constraint(tmp_path: Path) ->
     ]
 
 
+# 功能：root 身份运行控制器时拒绝启动 Docker sandbox
+# 设计：强制 os.getuid 返回 0，必须在调用 Docker CLI 前返回脱敏的稳定不可用原因
+async def test_execute_rejects_root_daemon_before_starting_docker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> _FakeProcess:
+        calls.append(argv)
+        return _FakeProcess()
+
+    monkeypatch.setattr(os, "getuid", lambda: 0)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    with pytest.raises(SandboxUnavailableError) as caught:
+        await _backend(tmp_path).execute(_request(tmp_path), _limits())
+
+    assert caught.value.backend == "docker"
+    assert caught.value.reason == "root-daemon-unsupported"
+    assert caught.value.__cause__ is None
+    assert calls == []
+
+
 # 功能：用户命令无法拆成 Docker 参数或污染安全生成的容器名
 # 设计：恶意 flag 文本只允许位于镜像后的单个 shell 参数，名称仅由固定前缀和随机 token 组成
 async def test_execute_keeps_command_in_one_argv_element_and_uses_safe_name(

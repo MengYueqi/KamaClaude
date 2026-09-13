@@ -333,6 +333,8 @@ class DockerBackend(SandboxBackend):
 
     # 在隔离容器中执行请求并标准化输出、超时与后端不可用错误
     async def execute(self, request: ExecRequest, limits: SandboxLimits) -> ExecResult:
+        if os.getuid() == 0:
+            raise SandboxUnavailableError("docker", "root-daemon-unsupported")
         container_name = f"kama-{secrets.token_hex(8)}"
         argv = self._build_argv(request, limits, container_name)
         try:
