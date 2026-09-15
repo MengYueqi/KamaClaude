@@ -8,9 +8,31 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kama_claude.core.events.bus import EventBus
-from kama_claude.core.llm.types import LlmResponse, UsageStats
+from kama_claude.core.llm.types import LlmResponse, ToolCallBlock, UsageStats
+from kama_claude.core.sandbox import (
+    ExecRequest,
+    ExecResult,
+    SandboxBackend,
+    SandboxLimits,
+    WorkspaceFS,
+)
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.subagent.tool import AgentResultTool, SpawnAgentTool
+from kama_claude.core.tools.builtin import BashTool, ListDirTool, ReadFileTool, WriteFileTool
+
+
+class _RecordingBackend(SandboxBackend):
+    name = "fake"
+    strongly_isolated = True
+
+    def __init__(self) -> None:
+        self.requests: list[ExecRequest] = []
+        self.limits: list[SandboxLimits] = []
+
+    async def execute(self, request: ExecRequest, limits: SandboxLimits) -> ExecResult:
+        self.requests.append(request)
+        self.limits.append(limits)
+        return ExecResult(0, "child bash output")
 
 
 def _make_provider(result_text: str = "child done") -> Any:
@@ -36,6 +58,11 @@ def _make_tool(
     tmp_path: Path,
     provider: Any = None,
     depth: int = 0,
+    workspace: WorkspaceFS | None = None,
+    backend: SandboxBackend | None = None,
+    limits: SandboxLimits | None = None,
+    env_allowlist: tuple[str, ...] = ("PATH", "LANG"),
+    runtime_dir: Path | None = None,
 ) -> tuple[SpawnAgentTool, BackgroundTaskRegistry, EventBus]:
     bus = EventBus()
     registry = BackgroundTaskRegistry()
@@ -48,6 +75,11 @@ def _make_tool(
         task_registry=registry,
         runs_dir=tmp_path,
         session_id="sess-test",
+        workspace=workspace or WorkspaceFS(tmp_path),
+        sandbox_backend=backend or _RecordingBackend(),
+        sandbox_limits=limits or SandboxLimits(30, 4_096, 256, 1.0, 32, 64),
+        env_allowlist=env_allowlist,
+        runtime_dir=runtime_dir or tmp_path / ".sandbox",
         depth=depth,
     )
     return tool, registry, bus
@@ -189,3 +221,107 @@ async def test_foreground_publishes_started_event(tmp_path: Path) -> None:
     assert len(started) == 1
     assert started[0].parent_run_id == "parent-run-01"
     assert started[0].description == "test task"
+
+
+# 功能：子和嵌套 registry 的 Bash、文件与 Spawn 工具共享根 Agent 注入的全部沙箱依赖
+# 设计：直接构建两层 registry，检查 workspace/backend/limits 的对象身份及运行目录值
+def test_child_and_nested_registries_share_sandbox_dependencies(tmp_path: Path) -> None:
+    workspace = WorkspaceFS(tmp_path)
+    backend = _RecordingBackend()
+    limits = SandboxLimits(19, 2_048, 320, 1.5, 36, 80)
+    env_allowlist = ("PATH", "LANG")
+    runtime_dir = tmp_path / ".sandbox"
+    tool, _, _ = _make_tool(
+        tmp_path,
+        workspace=workspace,
+        backend=backend,
+        limits=limits,
+        env_allowlist=env_allowlist,
+        runtime_dir=runtime_dir,
+    )
+
+    child_registry = tool._build_child_registry(EventBus(), "child-run", None)
+    child_read = child_registry.get("read_file")
+    child_bash = child_registry.get("bash")
+    child_write = child_registry.get("write_file")
+    child_list = child_registry.get("list_dir")
+    nested_tool = child_registry.get("spawn_agent")
+
+    assert isinstance(child_read, ReadFileTool)
+    assert isinstance(child_bash, BashTool)
+    assert isinstance(child_write, WriteFileTool)
+    assert isinstance(child_list, ListDirTool)
+    assert isinstance(nested_tool, SpawnAgentTool)
+    assert child_read._workspace is workspace
+    assert child_bash._workspace is workspace
+    assert child_bash._backend is backend
+    assert child_bash._limits is limits
+    assert child_bash._runtime_dir == runtime_dir.resolve()
+    assert child_write._workspace is workspace
+    assert child_list._workspace is workspace
+    assert nested_tool._workspace is workspace
+    assert nested_tool._sandbox_backend is backend
+    assert nested_tool._sandbox_limits is limits
+    assert nested_tool._env_allowlist is env_allowlist
+    assert nested_tool._runtime_dir is runtime_dir
+
+    nested_registry = nested_tool._build_child_registry(EventBus(), "nested-run", None)
+    nested_read = nested_registry.get("read_file")
+    nested_bash = nested_registry.get("bash")
+    nested_write = nested_registry.get("write_file")
+    nested_list = nested_registry.get("list_dir")
+
+    assert isinstance(nested_read, ReadFileTool)
+    assert isinstance(nested_bash, BashTool)
+    assert isinstance(nested_write, WriteFileTool)
+    assert isinstance(nested_list, ListDirTool)
+    assert nested_read._workspace is workspace
+    assert nested_bash._workspace is workspace
+    assert nested_bash._backend is backend
+    assert nested_bash._limits is limits
+    assert nested_bash._env_allowlist is env_allowlist
+    assert nested_bash._runtime_dir == runtime_dir.resolve()
+    assert nested_write._workspace is workspace
+    assert nested_list._workspace is workspace
+
+
+# 功能：子 Agent 调用 Bash 时必须执行根 Agent 传入的同一 fake backend
+# 设计：provider 先发出 bash tool call 再结束，断言 recording backend 收到子命令和共享 limits
+@pytest.mark.asyncio
+async def test_child_bash_executes_parent_recording_backend(tmp_path: Path) -> None:
+    class _BashCallingProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, *args: Any, **kwargs: Any) -> LlmResponse:
+            self.calls += 1
+            if self.calls == 1:
+                return LlmResponse(
+                    stop_reason="tool_use",
+                    tool_calls=[
+                        ToolCallBlock(
+                            id="child-bash-1",
+                            name="bash",
+                            input={"command": "child command"},
+                        )
+                    ],
+                )
+            return LlmResponse(stop_reason="end_turn", text="child done")
+
+    backend = _RecordingBackend()
+    limits = SandboxLimits(23, 3_000, 448, 1.25, 44, 84)
+    tool, _, _ = _make_tool(
+        tmp_path,
+        provider=_BashCallingProvider(),
+        backend=backend,
+        limits=limits,
+    )
+
+    result = await tool.invoke({"description": "child bash", "prompt": "run it"})
+
+    assert not result.is_error
+    assert result.content == "child done"
+    assert len(backend.requests) == 1
+    assert backend.requests[0].command == "child command"
+    assert backend.requests[0].cwd == tmp_path.resolve()
+    assert backend.limits == [limits]

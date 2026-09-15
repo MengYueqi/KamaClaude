@@ -910,6 +910,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | `tool_use_id` | `string` | yes |
 | `tool_name` | `string` | yes |
 | `params` | `object` | yes |
+| `execution` | `object` | no |
 | `ts` | `string` | yes |
 
 ```json
@@ -938,6 +939,11 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
       "title": "Params",
       "type": "object"
     },
+    "execution": {
+      "additionalProperties": true,
+      "title": "Execution",
+      "type": "object"
+    },
     "ts": {
       "title": "Ts",
       "type": "string"
@@ -962,9 +968,16 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
   "type": "tool.call_started",
   "run_id": "20260516-100000-abc123",
   "tool_use_id": "toolu_01",
-  "tool_name": "read_file",
+  "tool_name": "bash",
   "params": {
-    "path": "README.md"
+    "command": "pwd"
+  },
+  "execution": {
+    "backend": "docker",
+    "strongly_isolated": true,
+    "cwd": ".",
+    "workspace_access": "rw",
+    "network": "off"
   },
   "ts": "2026-05-16T10:00:00.001Z"
 }
@@ -1125,6 +1138,102 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
   "error_message": "file not found",
   "elapsed_ms": 1,
   "attempt": 1,
+  "ts": "2026-05-16T10:00:00.001Z"
+}
+```
+
+### PermissionRequestedEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `run_id` | `string` | yes |
+| `tool_use_id` | `string` | yes |
+| `tool_name` | `string` | yes |
+| `params` | `object` | yes |
+| `param_preview` | `string` | yes |
+| `session_id` | `string` | yes |
+| `execution` | `object` | no |
+| `ts` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "permission.requested",
+      "default": "permission.requested",
+      "title": "Type",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "tool_use_id": {
+      "title": "Tool Use Id",
+      "type": "string"
+    },
+    "tool_name": {
+      "title": "Tool Name",
+      "type": "string"
+    },
+    "params": {
+      "additionalProperties": true,
+      "title": "Params",
+      "type": "object"
+    },
+    "param_preview": {
+      "title": "Param Preview",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "execution": {
+      "additionalProperties": true,
+      "title": "Execution",
+      "type": "object"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "tool_use_id",
+    "tool_name",
+    "params",
+    "param_preview",
+    "session_id",
+    "ts"
+  ],
+  "title": "PermissionRequestedEvent",
+  "type": "object"
+}
+```
+
+**Example:**
+
+```json
+{
+  "type": "permission.requested",
+  "run_id": "20260516-100000-abc123",
+  "tool_use_id": "toolu_03",
+  "tool_name": "bash",
+  "params": {
+    "command": "git status"
+  },
+  "param_preview": "git status",
+  "session_id": "sess-abc123def456",
+  "execution": {
+    "backend": "docker",
+    "strongly_isolated": true,
+    "cwd": ".",
+    "workspace_access": "rw",
+    "network": "off"
+  },
   "ts": "2026-05-16T10:00:00.001Z"
 }
 ```

@@ -16,10 +16,10 @@ from pathlib import Path
 import pytest
 from dotenv import load_dotenv
 
-from kama_claude.core.config import KamaConfig
+from kama_claude.core.config import get_config
 from kama_claude.core.runner import AgentRunner
 
-# Load project .env so ANTHROPIC_API_KEY is available without going through get_config()
+# Load project .env before the test changes cwd; get_config() then applies every KAMA_* setting.
 load_dotenv(Path(__file__).parent.parent.parent / ".env", override=False)
 
 pytestmark = pytest.mark.integration
@@ -55,7 +55,7 @@ async def test_run_e2e_reads_file_and_succeeds(
     )
     runs_dir = tmp_path / "runs"
 
-    config = KamaConfig()
+    config = get_config()
     config.agent.max_steps = 5
 
     runner = AgentRunner(config, runs_dir=runs_dir)

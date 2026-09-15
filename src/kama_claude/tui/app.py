@@ -6,9 +6,8 @@ import logging
 import time
 from typing import Any
 
-log = logging.getLogger(__name__)
-
 from rich.markdown import Markdown
+from rich.markup import escape
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -22,11 +21,13 @@ from kama_claude.core.config import KamaConfig
 from kama_claude.core.skills.loader import SkillLoader
 from kama_claude.core.transport.socket_client import IpcError, SocketClient
 
+log = logging.getLogger(__name__)
+
+_EXECUTION_VALUE_MAX_LEN = 48
+
 
 def _preview(s: str, n: int) -> str:
     return s[:n] + "…" if len(s) > n else s
-
-
 
 
 def _params_str(params: dict[str, Any]) -> str:
@@ -47,6 +48,29 @@ def _param_summary(tool_name: str, params: dict[str, Any], max_len: int = 72) ->
     if not parts:
         parts = [f"{key}={value!r}" for key, value in list(params.items())[:2]]
     return _preview(", ".join(parts), max_len)
+
+
+# 将公开执行元数据格式化为稳定的单行沙箱摘要，并忽略未知字段
+def _execution_summary(execution: dict[str, Any]) -> str:
+    labels = (
+        ("sandbox", "backend"),
+        ("cwd", "cwd"),
+        ("workspace", "workspace_access"),
+        ("network", "network"),
+    )
+    return " ".join(
+        f"{label}={_safe_execution_value(execution[key])}"
+        for label, key in labels
+        if key in execution
+    )
+
+
+# 将单个公开元数据值压成有界单行文本，并转义 Rich 标记控制字符
+def _safe_execution_value(value: Any) -> str:
+    normalized = " ".join(str(value).split())
+    if len(normalized) > _EXECUTION_VALUE_MAX_LEN:
+        normalized = normalized[: _EXECUTION_VALUE_MAX_LEN - 1] + "…"
+    return escape(normalized)
 
 
 class LLMStreamBlock(Static):
@@ -87,11 +111,17 @@ class ToolCallBlock(Widget):
     """
 
     # 初始化工具调用信息
-    def __init__(self, tool_name: str, params: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        tool_name: str,
+        params: dict[str, Any],
+        execution: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__()
         self._tool_name = tool_name
         self._params = params
         self._params_full = _params_str(params)
+        self._execution = execution or {}
         self._output = ""
         self._elapsed_ms = 0
         self._is_error = False
@@ -110,6 +140,9 @@ class ToolCallBlock(Widget):
         line = f"  [dim]tool[/dim] [bold]{self._tool_name}[/bold]"
         if params_pre:
             line += f"  [dim]{params_pre}[/dim]"
+        execution_pre = _execution_summary(self._execution)
+        if execution_pre:
+            line += f"\n  [dim]{execution_pre}[/dim]"
         if self._finished:
             color = "red" if self._is_error else "green"
             status = "failed" if self._is_error else "done"
@@ -156,16 +189,20 @@ class PermissionSelect(Static):
     """
 
     _CHOICES: tuple[tuple[str, str, str], ...] = (
-        ("allow_once",   "Allow once",   "y / 1"),
+        ("allow_once", "Allow once", "y / 1"),
         ("always_allow", "Always allow", "a / 2"),
-        ("deny_once",    "Deny",         "n / 3"),
-        ("always_deny",  "Always deny",  "d / 4"),
+        ("deny_once", "Deny", "n / 3"),
+        ("always_deny", "Always deny", "d / 4"),
     )
     _KEY_MAP: dict[str, str] = {
-        "y": "allow_once",  "1": "allow_once",
-        "a": "always_allow","2": "always_allow",
-        "n": "deny_once",   "3": "deny_once",
-        "d": "always_deny", "4": "always_deny",
+        "y": "allow_once",
+        "1": "allow_once",
+        "a": "always_allow",
+        "2": "always_allow",
+        "n": "deny_once",
+        "3": "deny_once",
+        "d": "always_deny",
+        "4": "always_deny",
     }
 
     # 用户作出权限决策时发布，携带工具 ID 和决策字符串
@@ -204,7 +241,11 @@ class PermissionSelect(Static):
 
     # 焦点到达时记录，用于确认 focus() 是否真正生效
     def on_focus(self, event: events.Focus) -> None:
-        log.debug("PermissionSelect.on_focus  has_focus=%s  app.focused=%r", self.has_focus, self.app.focused)
+        log.debug(
+            "PermissionSelect.on_focus  has_focus=%s  app.focused=%r",
+            self.has_focus,
+            self.app.focused,
+        )
 
     # 焦点离开时记录，用于追踪是否被其他控件抢走焦点
     def on_blur(self, event: events.Blur) -> None:
@@ -252,11 +293,11 @@ class PermissionBlock(Static):
     """日志里的权限审批摘要"""
 
     _LABEL_MAP: dict[str, str] = {
-        "allow_once":   "allowed (once)",
+        "allow_once": "allowed (once)",
         "always_allow": "always allowed",
-        "deny_once":    "denied",
-        "always_deny":  "always denied",
-        "timeout":      "⏱ timed out",
+        "deny_once": "denied",
+        "always_deny": "always denied",
+        "timeout": "⏱ timed out",
     }
     LABEL_MAP = _LABEL_MAP
 
@@ -268,16 +309,25 @@ class PermissionBlock(Static):
             super().__init__()
 
     # 初始化审批块，记录工具 ID、名称和参数预览
-    def __init__(self, tool_use_id: str, tool_name: str, param_preview: str) -> None:
+    def __init__(
+        self,
+        tool_use_id: str,
+        tool_name: str,
+        param_preview: str,
+        execution: dict[str, Any] | None = None,
+    ) -> None:
         self._tool_use_id = tool_use_id
         self._tool_name = tool_name
         self._param_preview = param_preview
+        self._execution = execution or {}
         self._resolved = False
         super().__init__(self._pending_text(), classes="log-line")
 
     def _pending_text(self) -> str:
         preview = f"  [dim]{self._param_preview}[/dim]" if self._param_preview else ""
-        return f"[bold red]? permission[/bold red]  [bold]{self._tool_name}[/bold]{preview}"
+        metadata = _execution_summary(self._execution)
+        detail = f"\n  [dim]{metadata}[/dim]" if metadata else ""
+        return f"[bold red]? permission[/bold red]  [bold]{self._tool_name}[/bold]{preview}{detail}"
 
     # 将块收缩为单行摘要并发布 Resolved 消息
     def _resolve(self, decision: str) -> None:
@@ -288,8 +338,11 @@ class PermissionBlock(Static):
         icon = "[bold green]✓[/bold green]" if allowed else "[bold red]✗[/bold red]"
         label = self._LABEL_MAP.get(decision, decision)
         preview = f"  [dim]{self._param_preview}[/dim]" if self._param_preview else ""
+        metadata = _execution_summary(self._execution)
+        detail = f"  [dim]{metadata}[/dim]" if metadata else ""
         self.update(
-            f"{icon} permission  [bold]{self._tool_name}[/bold]{preview}  [dim]{label}[/dim]"
+            f"{icon} permission  [bold]{self._tool_name}[/bold]{preview}  "
+            f"[dim]{label}[/dim]{detail}"
         )
         self.post_message(self.Resolved(self, decision))
 
@@ -492,12 +545,12 @@ class KamaTuiApp(App[None]):
     """
 
     _BANNER = (
-        "[bold cyan]██╗  ██╗ █████╗ ███╗   ███╗ █████╗  ██████╗██╗      █████╗ ██╗   ██╗██████╗ ███████╗[/bold cyan]\n"
-        "[bold cyan]██║ ██╔╝██╔══██╗████╗ ████║██╔══██╗██╔════╝██║     ██╔══██╗██║   ██║██╔══██╗██╔════╝[/bold cyan]\n"
-        "[bold cyan]█████╔╝ ███████║██╔████╔██║███████║██║     ██║     ███████║██║   ██║██║  ██║█████╗  [/bold cyan]\n"
-        "[bold cyan]██╔═██╗ ██╔══██║██║╚██╔╝██║██╔══██║██║     ██║     ██╔══██║██║   ██║██║  ██║██╔══╝  [/bold cyan]\n"
-        "[bold cyan]██║  ██╗██║  ██║██║ ╚═╝ ██║██║  ██║╚██████╗███████╗██║  ██║╚██████╔╝██████╔╝███████╗[/bold cyan]\n"
-        "[bold cyan]╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝[/bold cyan]\n"
+        "[bold cyan]██╗  ██╗ █████╗ ███╗   ███╗ █████╗  ██████╗██╗      █████╗ ██╗   ██╗██████╗ ███████╗[/bold cyan]\n"  # noqa: E501
+        "[bold cyan]██║ ██╔╝██╔══██╗████╗ ████║██╔══██╗██╔════╝██║     ██╔══██╗██║   ██║██╔══██╗██╔════╝[/bold cyan]\n"  # noqa: E501
+        "[bold cyan]█████╔╝ ███████║██╔████╔██║███████║██║     ██║     ███████║██║   ██║██║  ██║█████╗  [/bold cyan]\n"  # noqa: E501
+        "[bold cyan]██╔═██╗ ██╔══██║██║╚██╔╝██║██╔══██║██║     ██║     ██╔══██║██║   ██║██║  ██║██╔══╝  [/bold cyan]\n"  # noqa: E501
+        "[bold cyan]██║  ██╗██║  ██║██║ ╚═╝ ██║██║  ██║╚██████╗███████╗██║  ██║╚██████╔╝██████╔╝███████╗[/bold cyan]\n"  # noqa: E501
+        "[bold cyan]╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝[/bold cyan]\n"  # noqa: E501
         "[dim]  输入消息开始对话  ·  键入 / 触发 skill  ·  Ctrl+C 退出[/dim]"
     )
 
@@ -647,11 +700,13 @@ class KamaTuiApp(App[None]):
             summary_tokens = result.get("summary_tokens", 0)
             saved_tokens = result.get("saved_tokens", 0)
             self._last_context_pct = 0.0
-            self._append(Static(
-                f"[bold cyan]⚡ Context compacted[/bold cyan]"
-                f"  [dim]summary={summary_tokens} tokens  saved≈{saved_tokens} tokens[/dim]",
-                classes="log-line",
-            ))
+            self._append(
+                Static(
+                    f"[bold cyan]⚡ Context compacted[/bold cyan]"
+                    f"  [dim]summary={summary_tokens} tokens  saved≈{saved_tokens} tokens[/dim]",
+                    classes="log-line",
+                )
+            )
         except (IpcError, RuntimeError, OSError) as e:
             self._append(Static(f"[red]compact error: {e}[/red]", classes="log-line"))
 
@@ -783,9 +838,11 @@ class KamaTuiApp(App[None]):
 
             try:
                 loop_task.add_done_callback(
-                    lambda t: log.error("loop_task failed: %s", t.exception())
-                    if not t.cancelled() and t.exception() is not None
-                    else None
+                    lambda t: (
+                        log.error("loop_task failed: %s", t.exception())
+                        if not t.cancelled() and t.exception() is not None
+                        else None
+                    )
                 )
                 params: dict[str, Any] = {
                     "topics": [
@@ -879,20 +936,24 @@ class KamaTuiApp(App[None]):
         elif t == "run.started":
             run_id = event.get("run_id", "")
             goal = event.get("goal", "")
-            self._append(Static(
-                f"[dim]run[/dim]  [cyan]{run_id}[/cyan]  [dim]{_preview(goal, 96)}[/dim]",
-                classes="run-header",
-            ))
+            self._append(
+                Static(
+                    f"[dim]run[/dim]  [cyan]{run_id}[/cyan]  [dim]{_preview(goal, 96)}[/dim]",
+                    classes="run-header",
+                )
+            )
 
         elif t == "skill.invoked":
             skill_name = event.get("skill_name", "")
             arguments = event.get("arguments", "")
             args_preview = _preview(arguments, 80) if arguments else ""
             args_part = f"  [dim]{args_preview}[/dim]" if args_preview else ""
-            self._append(Static(
-                f"[bold cyan]/{skill_name}[/bold cyan]{args_part}",
-                classes="log-line",
-            ))
+            self._append(
+                Static(
+                    f"[bold cyan]/{skill_name}[/bold cyan]{args_part}",
+                    classes="log-line",
+                )
+            )
 
         elif t == "subagent.started":
             run_id = event.get("run_id", "")
@@ -900,10 +961,13 @@ class KamaTuiApp(App[None]):
             self._subagent_run_ids[run_id] = description
             self._subagent_start_times[run_id] = time.monotonic()
             short_id = run_id[:8] if len(run_id) >= 8 else run_id
-            self._append(Static(
-                f"[dim]┌─[/dim] [cyan]{_preview(description, 72)}[/cyan]  [dim]{short_id}[/dim]",
-                classes="log-line",
-            ))
+            self._append(
+                Static(
+                    f"[dim]┌─[/dim] [cyan]{_preview(description, 72)}[/cyan]  "
+                    f"[dim]{short_id}[/dim]",
+                    classes="log-line",
+                )
+            )
 
         elif t == "subagent.finished":
             run_id = event.get("run_id", "")
@@ -913,32 +977,43 @@ class KamaTuiApp(App[None]):
             elapsed = f"  [dim]{time.monotonic() - start:.1f}s[/dim]" if start is not None else ""
             desc_part = f"[cyan]{_preview(description, 72)}[/cyan]{elapsed}"
             if status == "success":
-                self._append(Static(
-                    f"[dim]└─[/dim] [bold green]✓[/bold green] {desc_part}",
-                    classes="log-line",
-                ))
+                self._append(
+                    Static(
+                        f"[dim]└─[/dim] [bold green]✓[/bold green] {desc_part}",
+                        classes="log-line",
+                    )
+                )
             else:
-                self._append(Static(
-                    f"[dim]└─[/dim] [bold red]✗[/bold red] {desc_part}",
-                    classes="log-line",
-                ))
+                self._append(
+                    Static(
+                        f"[dim]└─[/dim] [bold red]✗[/bold red] {desc_part}",
+                        classes="log-line",
+                    )
+                )
 
         elif t == "step.started":
             run_id = event.get("run_id", "")
             if run_id in self._subagent_run_ids:
                 return
             step = event.get("step", "")
-            self._append(Static(
-                f"[dim]step {step}[/dim]",
-                classes="step-divider",
-            ))
+            self._append(
+                Static(
+                    f"[dim]step {step}[/dim]",
+                    classes="step-divider",
+                )
+            )
 
         elif t == "tool.call_started":
             tool_use_id = str(event.get("tool_use_id", ""))
             tool_name = str(event.get("tool_name", ""))
             params = event.get("params") or {}
+            execution = event.get("execution") or {}
             run_id = event.get("run_id", "")
-            tc_block = ToolCallBlock(tool_name, params)
+            tc_block = ToolCallBlock(
+                tool_name,
+                params,
+                execution if isinstance(execution, dict) else {},
+            )
             if run_id in self._subagent_run_ids:
                 tc_block.styles.padding = (0, 2, 0, 6)
             self._pending_tool_blocks[tool_use_id] = tc_block
@@ -965,16 +1040,20 @@ class KamaTuiApp(App[None]):
             steps = event.get("steps", 0)
             reason = event.get("reason") or ""
             if status == "success":
-                self._append(Static(
-                    f"[bold green]✓ completed[/bold green]  [dim]{steps} steps[/dim]",
-                    classes="run-ok",
-                ))
+                self._append(
+                    Static(
+                        f"[bold green]✓ completed[/bold green]  [dim]{steps} steps[/dim]",
+                        classes="run-ok",
+                    )
+                )
             else:
                 detail = f"  [dim]{reason}[/dim]" if reason else ""
-                self._append(Static(
-                    f"[bold red]✗ failed[/bold red]{detail}  [dim]{steps} steps[/dim]",
-                    classes="run-err",
-                ))
+                self._append(
+                    Static(
+                        f"[bold red]✗ failed[/bold red]{detail}  [dim]{steps} steps[/dim]",
+                        classes="run-err",
+                    )
+                )
 
         elif t == "llm.usage":
             run_id = event.get("run_id", "")
@@ -983,38 +1062,50 @@ class KamaTuiApp(App[None]):
             pct = float(event.get("context_pct") or 0.0)
             self._last_context_pct = pct
             ctx_bar = self._render_ctx_bar(pct)
-            self._append(Static(
-                f"[dim]  tokens  "
-                f"in={event.get('input_tokens')} "
-                f"out={event.get('output_tokens')} "
-                f"cache={event.get('cache_read_input_tokens')}[/dim]"
-                f"  {ctx_bar}",
-                classes="usage",
-            ))
+            self._append(
+                Static(
+                    f"[dim]  tokens  "
+                    f"in={event.get('input_tokens')} "
+                    f"out={event.get('output_tokens')} "
+                    f"cache={event.get('cache_read_input_tokens')}[/dim]"
+                    f"  {ctx_bar}",
+                    classes="usage",
+                )
+            )
 
         elif t == "context.compacted":
             orig = event.get("original_tokens", 0)
             summary = event.get("summary_tokens", 0)
             self._last_context_pct = 0.0
-            self._append(Static(
-                f"[bold cyan]⚡ Context compacted[/bold cyan]"
-                f"  [dim]original≈{orig} tokens → summary={summary} tokens[/dim]",
-                classes="log-line",
-            ))
+            self._append(
+                Static(
+                    f"[bold cyan]⚡ Context compacted[/bold cyan]"
+                    f"  [dim]original≈{orig} tokens → summary={summary} tokens[/dim]",
+                    classes="log-line",
+                )
+            )
 
         elif t == "permission.requested":
             tool_use_id = str(event.get("tool_use_id", ""))
             tool_name = str(event.get("tool_name", ""))
             param_preview = str(event.get("param_preview", ""))
+            execution = event.get("execution") or {}
             try:
                 _focused_repr = repr(self.focused)
             except Exception:
                 _focused_repr = "?"
             log.info(
                 "permission.requested tool=%s id=%s  app.focused=%s",
-                tool_name, tool_use_id, _focused_repr,
+                tool_name,
+                tool_use_id,
+                _focused_repr,
             )
-            perm_block = PermissionBlock(tool_use_id, tool_name, param_preview)
+            perm_block = PermissionBlock(
+                tool_use_id,
+                tool_name,
+                param_preview,
+                execution if isinstance(execution, dict) else {},
+            )
             self._pending_permission_blocks[tool_use_id] = perm_block
             prompt = self._prompt()
             if prompt is not None:
@@ -1023,10 +1114,14 @@ class KamaTuiApp(App[None]):
             self._append(perm_block)
             select = PermissionSelect(tool_use_id)
             self._mount_permission_select(select)
-            log.debug("PermissionSelect mounted before #prompt  pending=%d", len(self._pending_permission_blocks))
+            log.debug(
+                "PermissionSelect mounted before #prompt  pending=%d",
+                len(self._pending_permission_blocks),
+            )
 
         elif t == "permission.denied":
-            # 处理超时或断连等非用户交互触发的 deny（用户主动 deny 已由 on_permission_select_decided 处理）
+            # 处理超时或断连等非用户交互触发的 deny（用户主动 deny 已由
+            # on_permission_select_decided 处理）
             tool_use_id = str(event.get("tool_use_id", ""))
             decision = str(event.get("decision", "denied"))
             if tool_use_id in self._pending_permission_blocks:
@@ -1048,11 +1143,13 @@ class KamaTuiApp(App[None]):
         elif t == "log.line":
             level = event.get("level", "INFO")
             color = "bold red" if level == "ERROR" else ("yellow" if level == "WARNING" else "dim")
-            self._append(Static(
-                f"[{color}]{level}[/{color}]  "
-                f"[dim]{event.get('source', '')}[/dim]  {event.get('message', '')}",
-                classes="log-line",
-            ))
+            self._append(
+                Static(
+                    f"[{color}]{level}[/{color}]  "
+                    f"[dim]{event.get('source', '')}[/dim]  {event.get('message', '')}",
+                    classes="log-line",
+                )
+            )
 
 
 # TUI 入口：读取配置并启动 KamaTuiApp

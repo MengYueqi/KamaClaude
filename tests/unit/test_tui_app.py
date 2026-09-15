@@ -1,15 +1,26 @@
 from __future__ import annotations
 
 from rich.markdown import Markdown
+from rich.text import Text
 from textual.widget import Widget
 
 from kama_claude.tui.app import (
     KamaTuiApp,
     LLMStreamBlock,
+    PermissionBlock,
     ToolCallBlock,
+    _execution_summary,
     _param_summary,
     _preview,
 )
+
+_DOCKER_EXECUTION = {
+    "backend": "docker",
+    "strongly_isolated": True,
+    "cwd": ".",
+    "workspace_access": "rw",
+    "network": "off",
+}
 
 
 # 功能：验证 _preview 超出长度时截断并追加省略号
@@ -25,6 +36,18 @@ def test_param_summary_prefers_key_fields() -> None:
     assert _param_summary("read_file", {"path": "README.md"}) == "path='README.md'"
     assert _param_summary("bash", {"command": "echo hi", "timeout": 1}) == "command='echo hi'"
     assert _param_summary("note_save", {"content": "Python 3.12"}) == "content='Python 3.12'"
+
+
+# 功能：执行元数据被压缩成稳定、无 Secret 的沙箱摘要行
+# 设计：只渲染批准的公开键，并忽略额外环境字段，避免 UI 意外展示敏感值
+def test_execution_summary_renders_public_sandbox_facts_only() -> None:
+    execution = {**_DOCKER_EXECUTION, "env": {"API_KEY": "must-not-leak"}}
+
+    rendered = _execution_summary(execution)
+
+    assert rendered == "sandbox=docker cwd=. workspace=rw network=off"
+    assert "API_KEY" not in rendered
+    assert "must-not-leak" not in rendered
 
 
 # 功能：验证 llm.token 事件累积到 LLMStreamBlock，不连续 token 各自新开一块
@@ -147,6 +170,120 @@ def test_tool_call_started_and_finished() -> None:
     assert isinstance(block, ToolCallBlock)
     assert block._finished  # type: ignore[attr-defined]
     assert block._output == "hi"  # type: ignore[attr-defined]
+
+
+# 功能：tool.call_started 的工具块展示紧凑沙箱执行摘要
+# 设计：走真实事件处理入口，断言 metadata 进入 ToolCallBlock 摘要而非只测纯函数
+def test_tool_call_started_renders_execution_metadata() -> None:
+    app = KamaTuiApp("127.0.0.1", 9999)
+    appended: list[Widget] = []
+    app._append = lambda w: appended.append(w)  # type: ignore[method-assign]
+
+    app._handle_event(
+        {
+            "type": "tool.call_started",
+            "tool_use_id": "uid-meta",
+            "tool_name": "bash",
+            "params": {"command": "echo hi"},
+            "execution": _DOCKER_EXECUTION,
+            "run_id": "r",
+            "ts": "t",
+        }
+    )
+
+    block = appended[0]
+    assert isinstance(block, ToolCallBlock)
+    assert "sandbox=docker cwd=. workspace=rw network=off" in block._summary()
+
+
+# 功能：permission.requested 的审批块展示同一紧凑沙箱执行摘要
+# 设计：直接构造审批块以隔离挂载和焦点逻辑，验证待审批文本的信息完整性
+def test_permission_block_renders_execution_metadata() -> None:
+    block = PermissionBlock("uid-meta", "bash", "echo hi", _DOCKER_EXECUTION)
+
+    assert "sandbox=docker cwd=. workspace=rw network=off" in block._pending_text()
+
+
+# 功能：恶意 execution 值经 tool-started 路径后不能伪造 Rich 样式或额外日志行
+# 设计：通过真实事件处理入口取得工具块，再由 Rich 解析摘要并检查恶意片段仅有外层 dim 样式
+def test_tool_started_execution_metadata_escapes_markup_and_newlines() -> None:
+    app = KamaTuiApp("127.0.0.1", 9999)
+    appended: list[Widget] = []
+    app._append = lambda widget: appended.append(widget)  # type: ignore[method-assign]
+    execution = {
+        "backend": "[bold red]forged[/bold red]\r\nFORGED-LINE",
+        "cwd": ".\n[link=https://evil.invalid]click[/link]",
+        "workspace_access": "r" * 200,
+        "network": "off",
+    }
+
+    app._handle_event(
+        {
+            "type": "tool.call_started",
+            "tool_use_id": "uid-hostile",
+            "tool_name": "bash",
+            "params": {"command": "echo hi"},
+            "execution": execution,
+            "run_id": "r",
+            "ts": "t",
+        }
+    )
+
+    block = appended[0]
+    assert isinstance(block, ToolCallBlock)
+    markup = block._summary()
+    rendered = Text.from_markup(markup)
+    assert markup.count("\n") == 1
+    assert "[bold red]forged[/bold red] FORGED-LINE" in rendered.plain
+    forged_at = rendered.plain.index("forged")
+    forged_styles = [
+        str(span.style)
+        for span in rendered.spans
+        if span.start <= forged_at < span.end
+    ]
+    assert forged_styles == ["dim"]
+    assert "r" * 47 + "…" in rendered.plain
+    assert "r" * 48 not in rendered.plain
+    assert len(markup) < 300
+
+
+# 功能：恶意 execution 值经 permission-requested 路径后保持单行字面文本且不会触发 MarkupError
+# 设计：屏蔽未挂载 App 的选择控件挂载，仅保留真实事件分发与 PermissionBlock 渲染路径
+def test_permission_requested_execution_metadata_escapes_markup_and_newlines() -> None:
+    app = KamaTuiApp("127.0.0.1", 9999)
+    appended: list[Widget] = []
+    app._append = lambda widget: appended.append(widget)  # type: ignore[method-assign]
+    app._mount_permission_select = lambda _: None  # type: ignore[method-assign]
+
+    app._handle_event(
+        {
+            "type": "permission.requested",
+            "tool_use_id": "uid-hostile",
+            "tool_name": "bash",
+            "param_preview": "echo hi",
+            "execution": {
+                "backend": "docker\n[bold magenta]FORGED-LINE[/bold magenta]",
+                "cwd": ".",
+                "workspace_access": "rw",
+                "network": "[link=https://evil.invalid]off[/link]",
+            },
+        }
+    )
+
+    block = appended[0]
+    assert isinstance(block, PermissionBlock)
+    markup = block._pending_text()
+    rendered = Text.from_markup(markup)
+    assert markup.count("\n") == 1
+    assert "docker [bold magenta]FORGED-LINE[/bold magenta]" in rendered.plain
+    forged_at = rendered.plain.index("FORGED-LINE")
+    forged_styles = [
+        str(span.style)
+        for span in rendered.spans
+        if span.start <= forged_at < span.end
+    ]
+    assert forged_styles == ["dim"]
+    assert "[link=https://evil.invalid]off[/link]" in rendered.plain
 
 
 # 功能：验证 note_save 成功完成时工具块摘要显示 remembered

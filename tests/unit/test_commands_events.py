@@ -4,7 +4,11 @@ import pytest
 from pydantic import ValidationError
 
 from kama_claude.core.bus.commands import PingCommand, PongResult
-from kama_claude.core.bus.events import CoreStartedEvent
+from kama_claude.core.bus.events import (
+    CoreStartedEvent,
+    PermissionRequestedEvent,
+    ToolCallStartedEvent,
+)
 
 
 # 功能：验证 PingCommand 序列化后再反序列化，client 和 type 字段完整保留
@@ -46,3 +50,39 @@ def test_core_started_event_roundtrip() -> None:
     evt2 = CoreStartedEvent.model_validate_json(evt.model_dump_json())
     assert evt2.listen_addr == "127.0.0.1:7437"
     assert evt2.type == "core.started"
+
+
+# 功能：旧版工具开始事件未携带 execution 时仍可解析，并得到空元数据
+# 设计：直接验证缺失可选字段的旧 wire payload，防止协议升级破坏现有客户端重放
+def test_tool_call_started_legacy_payload_defaults_execution() -> None:
+    event = ToolCallStartedEvent.model_validate(
+        {
+            "type": "tool.call_started",
+            "run_id": "r1",
+            "tool_use_id": "t1",
+            "tool_name": "bash",
+            "params": {"command": "pwd"},
+            "ts": "2026-09-13T00:00:00Z",
+        }
+    )
+
+    assert event.execution == {}
+
+
+# 功能：旧版权限请求事件未携带 execution 时仍可解析，并得到空元数据
+# 设计：覆盖第二个新增字段的向后兼容性，确保历史 events.jsonl 可继续读取
+def test_permission_requested_legacy_payload_defaults_execution() -> None:
+    event = PermissionRequestedEvent.model_validate(
+        {
+            "type": "permission.requested",
+            "run_id": "r1",
+            "tool_use_id": "t1",
+            "tool_name": "bash",
+            "params": {"command": "pwd"},
+            "param_preview": "pwd",
+            "session_id": "s1",
+            "ts": "2026-09-13T00:00:00Z",
+        }
+    )
+
+    assert event.execution == {}

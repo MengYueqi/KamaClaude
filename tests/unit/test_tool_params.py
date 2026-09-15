@@ -16,6 +16,14 @@ def test_bash_params_valid() -> None:
     p = BashParams.model_validate({"command": "echo hi"})
     assert p.command == "echo hi"
     assert p.timeout == 60
+    assert p.cwd == "."
+
+
+# 功能：BashParams 保留显式相对 cwd，供 WorkspaceFS 在执行时校验
+# 设计：直接解析子目录文本，不在参数层做路径展开
+def test_bash_params_accepts_relative_cwd() -> None:
+    p = BashParams.model_validate({"command": "pwd", "cwd": "src"})
+    assert p.cwd == "src"
 
 
 # 功能：验证 BashParams timeout 上限被 pydantic le=120 约束

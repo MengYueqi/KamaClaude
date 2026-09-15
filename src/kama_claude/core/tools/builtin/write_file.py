@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 from pydantic import BaseModel, ConfigDict
 
+from kama_claude.core.sandbox import WorkspaceFS
 from kama_claude.core.tools.base import BaseTool, ToolResult
 
 _MAX_BYTES = 1 * 1024 * 1024  # 1 MB
@@ -39,14 +42,15 @@ class WriteFileTool(BaseTool):
         "required": ["path", "content"],
     }
 
-    # 写入文件内容；超 1MB 拒绝；禁止 .. 路径遍历；自动创建父目录
+    # 注入固定的 WorkspaceFS 以限制文件写入范围
+    def __init__(self, workspace: WorkspaceFS) -> None:
+        self._workspace = workspace
+
+    # 原子写入工作区内文件；超 1MB 拒绝并自动创建父目录
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = WriteFileParams.model_validate(params)
-        path_str = p.path
         content = p.content
-
-        if ".." in Path(path_str).parts:
-            raise PermissionError(f"path traversal not allowed: {path_str}")
+        path = self._workspace.resolve(p.path, must_exist=False)
 
         encoded = content.encode("utf-8")
         if len(encoded) > _MAX_BYTES:
@@ -56,8 +60,19 @@ class WriteFileTool(BaseTool):
                 error_type="runtime_error",
             )
 
-        path = Path(path_str)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        path = self._workspace.resolve(p.path, must_exist=False)
+        temp_path: Path | None = None
+        try:
+            with NamedTemporaryFile(delete=False, dir=path.parent) as temporary_file:
+                temp_path = Path(temporary_file.name)
+                temporary_file.write(encoded)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+            os.replace(temp_path, path)
+            temp_path = None
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
 
-        return ToolResult(content=f"wrote {len(encoded)} bytes to {path_str}")
+        return ToolResult(content=f"wrote {len(encoded)} bytes to {p.path}")

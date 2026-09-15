@@ -342,7 +342,15 @@ Python
 
 我们项目专栏上，简历写法，项目亮点，都不强调编程语言，都聚焦Agent原理。
 
+### Sandbox 与工作区边界
 
+内建的 `read_file`、`write_file`、`list_dir` 和 `bash` 工具都使用在 daemon 启动时固定的 Workspace。文件工具和 `bash.cwd` 只接受相对 Workspace 的路径：绝对路径、`..` 越界路径以及解析到 Workspace 外部的符号链接都会被拒绝。因此，模型、Skill 和工具调用方需要把旧的绝对文件路径迁移为相对路径，例如将 `/project/src/main.py` 改为 `src/main.py`。
+
+默认后端是 `host`，它是为了兼容现有安装而保留的弱隔离模式：它会使用固定工作目录、受限环境、进程组清理、超时和输出上限，但不能阻止命令读取宿主机文件或访问网络。需要更强边界时，请显式配置 Docker 后端。Docker 模式只挂载 Workspace 到 `/workspace`，默认禁网，使用只读根文件系统、非 root 用户、移除 Linux capabilities、禁止提权和资源限制；Docker CLI、daemon 或镜像不可用时会返回 `sandbox_unavailable`，不会回退到 `host`。
+
+命令进程从显式环境白名单构建；默认只传递 `PATH`、`LANG`、`LC_ALL` 和 `TERM`，并使用隔离的 `HOME`、`TMPDIR`。API Key 不会自动继承到命令进程（请勿将密钥主动加入 `env_allowlist`）。Docker Workspace 当前为读写挂载，所以获批命令仍可修改或删除 Workspace 内的文件；Copy-on-Write / Git worktree 审批流程尚未实现。
+
+Docker 模式的配置、镜像构建、排障和完整验证步骤见 [RUNBOOK.md](RUNBOOK.md)。
 
 
 

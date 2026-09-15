@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Discriminator
+from pydantic import BaseModel, Discriminator, Field
 
 
 class CoreStartedEvent(BaseModel):
@@ -47,6 +47,7 @@ class ToolCallStartedEvent(BaseModel):
     tool_use_id: str
     tool_name: str
     params: dict[str, Any]
+    execution: dict[str, Any] = Field(default_factory=dict)
     ts: str
 
 
@@ -158,6 +159,7 @@ class PermissionRequestedEvent(BaseModel):
     params: dict[str, Any]
     param_preview: str
     session_id: str
+    execution: dict[str, Any] = Field(default_factory=dict)
     ts: str
 
 

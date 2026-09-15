@@ -4,11 +4,178 @@ from pathlib import Path
 
 import pytest
 
-from kama_claude.core.config import get_config
+from kama_claude.core.config import SandboxConfig, get_config
 
 
+# 将给定内容写入临时 .env 文件
 def _write_env(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
+
+
+# 清除会影响沙箱配置解析的系统环境变量
+def _clear_sandbox_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "KAMA_CONFIG",
+        "KAMA_SANDBOX_BACKEND",
+        "KAMA_SANDBOX_WORKSPACE_ROOT",
+        "KAMA_SANDBOX_NETWORK",
+        "KAMA_SANDBOX_DOCKER_IMAGE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+# 功能：返回使用显式 TOML 路径解析的沙箱配置
+# 设计：隔离默认家目录和项目本地配置，确保断言覆盖真实 TOML 读取路径
+def _load_sandbox_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml_content: str
+) -> SandboxConfig:
+    config_path = tmp_path / "kama.toml"
+    config_path.write_text(toml_content, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    _clear_sandbox_env(monkeypatch)
+    monkeypatch.setenv("KAMA_CONFIG", str(config_path))
+    return get_config().sandbox
+
+
+# 功能：验证未设置配置源时产生精确的沙箱默认值
+# 设计：从 get_config 的真实默认构造路径读取，避免只断言 dataclass 常量
+def test_sandbox_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    _clear_sandbox_env(monkeypatch)
+
+    sandbox = get_config().sandbox
+
+    assert sandbox == SandboxConfig()
+
+
+# 功能：验证合法 [sandbox] TOML 将全部字段解析为规范类型
+# 设计：使用真实文件和显式 KAMA_CONFIG，覆盖配置表、列表和 cpu_count 的浮点规范化
+def test_sandbox_valid_toml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sandbox = _load_sandbox_config(
+        tmp_path,
+        monkeypatch,
+        """[sandbox]
+backend = "docker"
+workspace_root = "./work"
+network = true
+docker_image = "registry.example/kama:latest"
+timeout_s = 30
+output_limit_bytes = 4096
+memory_mb = 512
+cpu_count = 3
+pids_limit = 64
+tmpfs_mb = 128
+env_allowlist = ["PATH", "CUSTOM"]
+""",
+    )
+
+    assert sandbox == SandboxConfig(
+        backend="docker",
+        workspace_root="./work",
+        network=True,
+        docker_image="registry.example/kama:latest",
+        timeout_s=30,
+        output_limit_bytes=4096,
+        memory_mb=512,
+        cpu_count=3.0,
+        pids_limit=64,
+        tmpfs_mb=128,
+        env_allowlist=["PATH", "CUSTOM"],
+    )
+
+
+# 功能：拒绝未知 sandbox 键和所有受限字段的错误类型或非法值
+# 设计：通过真实 TOML 解析参数化覆盖严格边界，并专门确认 bool 不能作为数值限制
+@pytest.mark.parametrize(
+    ("toml_content", "error"),
+    [
+        ('[sandbox]\nunknown = "value"\n', r"Unknown \[sandbox\] keys"),
+        ('[sandbox]\nbackend = "remote"\n', "sandbox.backend"),
+        ('[sandbox]\ntimeout_s = 0\n', "sandbox.timeout_s"),
+        ('[sandbox]\noutput_limit_bytes = true\n', "sandbox.output_limit_bytes"),
+        ('[sandbox]\nmemory_mb = -1\n', "sandbox.memory_mb"),
+        ('[sandbox]\ncpu_count = 0\n', "sandbox.cpu_count"),
+        ('[sandbox]\npids_limit = 0\n', "sandbox.pids_limit"),
+        ('[sandbox]\ntmpfs_mb = 0\n', "sandbox.tmpfs_mb"),
+        ('[sandbox]\nnetwork = "false"\n', "sandbox.network"),
+        ('[sandbox]\ndocker_image = ""\n', "sandbox.docker_image"),
+        ('[sandbox]\ndocker_image = "   "\n', "sandbox.docker_image"),
+        ('[sandbox]\nworkspace_root = 1\n', "sandbox.workspace_root"),
+        ('[sandbox]\nbackend = ["host"]\n', "sandbox.backend"),
+        ('[sandbox]\nbackend = { value = "host" }\n', "sandbox.backend"),
+        ('[sandbox]\nenv_allowlist = ["PATH", 1]\n', "sandbox.env_allowlist"),
+    ],
+)
+def test_sandbox_invalid_toml_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml_content: str, error: str
+) -> None:
+    with pytest.raises(SystemExit, match=error):
+        _load_sandbox_config(tmp_path, monkeypatch, toml_content)
+
+
+# 功能：验证四个沙箱环境变量覆盖 TOML 与 .env 中的值
+# 设计：对每个字段同时提供 TOML、.env 和系统环境变量，确认完整优先级链以系统环境变量结尾
+def test_sandbox_system_env_overrides_dotenv_and_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "kama.toml"
+    config_path.write_text(
+        """[sandbox]
+backend = "host"
+workspace_root = "toml-workspace"
+network = false
+docker_image = "toml-image"
+""",
+        encoding="utf-8",
+    )
+    _write_env(
+        tmp_path / ".env",
+        """KAMA_SANDBOX_BACKEND=docker
+KAMA_SANDBOX_WORKSPACE_ROOT=dotenv-workspace
+KAMA_SANDBOX_NETWORK=true
+KAMA_SANDBOX_DOCKER_IMAGE=dotenv-image
+""",
+    )
+    monkeypatch.chdir(tmp_path)
+    _clear_sandbox_env(monkeypatch)
+    monkeypatch.setenv("KAMA_CONFIG", str(config_path))
+    monkeypatch.setenv("KAMA_SANDBOX_BACKEND", "host")
+    monkeypatch.setenv("KAMA_SANDBOX_WORKSPACE_ROOT", "system-workspace")
+    monkeypatch.setenv("KAMA_SANDBOX_NETWORK", "false")
+    monkeypatch.setenv("KAMA_SANDBOX_DOCKER_IMAGE", "system-image")
+
+    sandbox = get_config().sandbox
+
+    assert sandbox.backend == "host"
+    assert sandbox.workspace_root == "system-workspace"
+    assert sandbox.network is False
+    assert sandbox.docker_image == "system-image"
+
+
+# 功能：拒绝无法明确解释为布尔值的 KAMA_SANDBOX_NETWORK
+# 设计：环境变量不允许未知字符串隐式启用网络，防止配置拼写错误扩大权限
+def test_sandbox_network_env_rejects_unknown_boolean_spelling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _clear_sandbox_env(monkeypatch)
+    monkeypatch.setenv("KAMA_SANDBOX_NETWORK", "sometimes")
+
+    with pytest.raises(SystemExit, match="KAMA_SANDBOX_NETWORK"):
+        get_config()
+
+
+# 功能：拒绝仅含空白的 KAMA_SANDBOX_DOCKER_IMAGE
+# 设计：环境变量走与 TOML 相同的最终验证，避免空白镜像名穿过后端安全边界
+def test_sandbox_docker_image_env_rejects_whitespace_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _clear_sandbox_env(monkeypatch)
+    monkeypatch.setenv("KAMA_SANDBOX_DOCKER_IMAGE", "   ")
+
+    with pytest.raises(SystemExit, match="sandbox.docker_image"):
+        get_config()
 
 
 # 功能：验证 .env 文件中的值被正确加载并覆盖内建默认值

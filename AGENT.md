@@ -17,6 +17,11 @@ uv run pytest tests/unit -v           # unit only (fast, no daemon)
 uv run pytest tests/integration -v    # needs no running daemon; fixture spawns one
 uv run pytest tests/ -v               # all
 
+# Sandbox release gates
+uv run pytest tests/integration -m "not docker_sandbox" -v
+docker build --target sandbox-runtime -t kama-sandbox:py312 .
+KAMA_TEST_DOCKER_SANDBOX=1 uv run pytest tests/integration/test_sandbox_docker.py -v
+
 # Single test
 uv run pytest tests/unit/test_envelope.py::test_request_roundtrip -v
 
@@ -69,6 +74,16 @@ Four-tier priority: **built-in defaults → `~/.kama/config.toml` → `.env` →
 S0 keys: `host` (default `127.0.0.1`), `port` (default `7437`), `log_level`, `log_file`. Config file is silently skipped if absent; unknown keys cause a hard exit.
 
 Relevant env vars: `KAMA_CONFIG`, `KAMA_HOST`, `KAMA_PORT`, `KAMA_LOG_LEVEL`, `KAMA_LOG_FILE`, `KAMA_LOG_FORMAT`.
+
+### Sandbox configuration and guarantees
+
+`KamaConfig.sandbox` defaults to `backend="host"`, `workspace_root="."`, `network=false`, `docker_image="kama-sandbox:py312"`, a 120-second limit, and `env_allowlist=["PATH", "LANG", "LC_ALL", "TERM"]`. The supported overrides are `KAMA_SANDBOX_BACKEND`, `KAMA_SANDBOX_WORKSPACE_ROOT`, `KAMA_SANDBOX_NETWORK`, and `KAMA_SANDBOX_DOCKER_IMAGE`.
+
+File-tool paths and `bash.cwd` are always Workspace-relative. Do not construct calls with absolute paths; absolute paths, traversal outside the root, and external symlink targets are rejected. `host` remains a compatibility backend and is not strongly isolated: it constrains cwd, child environment, timeout, output, and process cleanup, but cannot prevent host filesystem or network access.
+
+For a strong command boundary, build the image with `docker build --target sandbox-runtime -t kama-sandbox:py312 .` and configure `backend="docker"`. Docker mounts only the fixed Workspace at `/workspace`, disables networking unless `network=true`, and applies a read-only root, non-root user, dropped capabilities, no-new-privileges, PID/memory/CPU limits, and a `/tmp` tmpfs. A missing Docker CLI, daemon, or usable image is surfaced as `sandbox_unavailable`; never add a fallback from Docker to `host`.
+
+Child command environments are built from the positive allowlist, with isolated `HOME` and `TMPDIR`; API keys are not inherited automatically. Do not add secrets to `env_allowlist`. The Docker Workspace mount is intentionally read-write, so an approved command can still damage files inside it. Copy-on-Write/worktree approval is deferred and must not be assumed.
 
 ### Daemon entry (`src/kama_claude/core/app.py`)
 
